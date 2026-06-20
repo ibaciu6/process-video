@@ -1,0 +1,15 @@
+# Config with credentials — copy config.example.json → config.json
+config.json
+
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+*$py.class
+.env
+venv/
+.venv/
+output/
+*.mp4
+*.mp3
+*.log

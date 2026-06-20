@@ -1,0 +1,7 @@
+# Python: stdlib only — no pip packages required
+#
+# External CLI tools (install via install.sh or manually):
+#   mkvtoolnix   - apt install mkvtoolnix          (mkvmerge for remuxing)
+#   ffmpeg       - apt install ffmpeg               (ffprobe for track inspection)
+#   subliminal   - pip install subliminal           (optional subtitle downloader)
+#   tinyMediaManager - https://www.tinymediamanager.org/download/  (optional metadata GUI)

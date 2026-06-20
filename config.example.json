@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy this file to config.json and fill in your values. config.json is gitignored.",
+  "api_keys": {
+    "tmdb": "",
+    "omdb": "",
+    "opensubtitles_com_api_key": "",
+    "opensubtitles_com_user": "",
+    "opensubtitles_com_password": "",
+    "opensubtitles_org_user": "",
+    "opensubtitles_org_password": ""
+  },
+  "tools": {
+    "mkvmerge_dir": "",
+    "tmm_dir": "/opt/tinyMediaManager"
+  },
+  "defaults": {
+    "root_dir": "/mnt/data/media"
+  }
+}
