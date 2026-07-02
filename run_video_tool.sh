@@ -60,5 +60,18 @@ while (($# > 0)); do
   esac
 done
 
-ROOT="${ROOT:-$(readlink -f .)}"
-exec "$PY" "$PY_SCRIPT" --root "$ROOT" "${EXTRA_ARGS[@]}"
+# Default to interactive menu (skip superfluous series/movies/exit submenu)
+# Only when no mode/action flag is passed by user
+has_mode_flag() { local a; for a in "${EXTRA_ARGS[@]}"; do case "$a" in --mode|--check-deps|--install-deps|--help|-h|--interactive|-i|--menu) return 0;; esac; done; return 1; }
+if ! has_mode_flag; then
+  if [[ -n "$ROOT" ]]; then
+    exec "$PY" "$PY_SCRIPT" --root "$ROOT" --interactive "${EXTRA_ARGS[@]}"
+  else
+    exec "$PY" "$PY_SCRIPT" --interactive "${EXTRA_ARGS[@]}"
+  fi
+fi
+if [[ -n "$ROOT" ]]; then
+  exec "$PY" "$PY_SCRIPT" --root "$ROOT" "${EXTRA_ARGS[@]}"
+else
+  exec "$PY" "$PY_SCRIPT" "${EXTRA_ARGS[@]}"
+fi

@@ -3,13 +3,17 @@ set -euo pipefail
 
 echo "==> Installing required packages..."
 sudo apt-get update -qq
-sudo apt-get install -y mkvtoolnix ffmpeg python3
+sudo apt-get install -y mkvtoolnix ffmpeg python3 imagemagick
 
-echo "==> Installing optional subtitle downloader..."
+echo "==> Installing subtitle downloader..."
 if command -v pip3 &>/dev/null; then
-    pip3 install --user subliminal
+    pip3 install --user --break-system-packages subliminal 2>/dev/null ||
+    pip3 install --user subliminal 2>/dev/null ||
+    echo "  subliminal install skipped (try: pip3 install --user subliminal)"
 else
-    echo "  pip3 not found — skipping subliminal (optional)"
+    echo "  pip3 not found — installing via apt..."
+    sudo apt-get install -y python3-pip python3-subliminal 2>/dev/null ||
+    echo "  try: sudo apt install python3-pip && pip3 install --user subliminal"
 fi
 
 echo ""

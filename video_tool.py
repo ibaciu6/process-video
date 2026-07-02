@@ -3,6 +3,7 @@
 
 import argparse
 import codecs
+import io
 import json
 import math
 import os
@@ -13,6 +14,8 @@ import sys
 import uuid
 import urllib.error
 import urllib.parse
+import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -202,6 +205,35 @@ RE_EXCESS_BLANKS = re.compile(r"(\r?\n){3,}")
 _SECTION_WIDTH = 62
 _SECTION_RULE = "=" * _SECTION_WIDTH
 
+# Verbose logging
+_VERBOSE = True
+
+def _v(msg: str) -> None:
+    if _VERBOSE:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+        print(f"  [{ts}] {msg}")
+
+def _vv(msg: str) -> None:
+    if _VERBOSE:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+        print(f"  [{ts}]   {msg}")
+
+def _log_cmd(cmd: list[str]) -> None:
+    if _VERBOSE:
+        _vv(f"CMD: {' '.join(str(c) for c in cmd)[:300]}")
+
+def _log_time(label: str) -> None:
+    if _VERBOSE:
+        _vv(f"[TIMING] {label}")
+
+def _timer_start() -> float:
+    return datetime.now().timestamp()
+
+def _timer_elapsed(start: float, label: str) -> None:
+    if _VERBOSE:
+        elapsed = datetime.now().timestamp() - start
+        _vv(f"[TIMING] {label}: {elapsed:.2f}s")
+
 # Ffprobe language for muxed tracks
 MKV_SIDECAR_SRT_LANGUAGE = "ro"
 
@@ -285,6 +317,8 @@ def is_own_file(fp: Path, root: Path) -> bool:
 # ===========================================================================
 
 def _mkvmerge_identify(path: Path, *, exe: str) -> dict:
+    _v(f"Identify MKV: {path.name}")
+    _log_cmd([exe, "-J", str(path)])
     proc = subprocess.run([exe, "-J", str(path)], capture_output=True, timeout=300)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip())
@@ -318,16 +352,258 @@ def _mkv_is_romanian_subtitle(props: dict) -> bool:
     return False
 
 def _has_romanian_subtitle(video_path: Path) -> bool:
+    _vv(f"ffprobe RO check: {video_path.name}")
     try:
         proc = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(video_path)],
             capture_output=True, timeout=30)
-        if proc.returncode != 0: return False
+        if proc.returncode != 0:
+            _vv(f"  ffprobe failed rc={proc.returncode}")
+            return False
         for s in json.loads(proc.stdout).get("streams", []):
             if s.get("codec_type") != "subtitle": continue
-            if (s.get("tags") or {}).get("language", "").lower() in ("ro", "rum", "ron"): return True
+            lang = (s.get("tags") or {}).get("language", "").lower()
+            if lang in ("ro", "rum", "ron"):
+                _vv(f"  found RO subtitle track")
+                return True
+        _vv(f"  no RO subtitle track")
         return False
-    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired): return False
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as e:
+        _vv(f"  ffprobe error: {e}")
+        return False
+
+def _has_romanian_subtitle_sidecar(video_path: Path) -> bool:
+    """Check if a sidecar .srt file exists with Romanian content.
+
+    Returns True if there's a sidecar .srt file or embedded Romanian subtitles.
+    """
+    # Check for sidecar .srt file
+    srt_path = video_path.with_suffix(".srt")
+    if srt_path.is_file():
+        # For now, assume sidecar files are Romanian
+        # Could be enhanced with actual content checking
+        return True
+
+    # Also check for embedded Romanian subtitles
+    if _has_romanian_subtitle(video_path):
+        return True
+
+    return False
+
+def _download_from_romanian_subtitles_better(query: str, dest: Path, *, lang: str = "romanian", tmdb_api_key: str = "", tmdb_id: int | None = None) -> bool:
+    """Download subtitles from Romanian subtitle sites.
+
+    Fallback chain (1→2→3):
+    1. titrari.ro — via IMDB ID lookup (PHPSESSID cookie, raw/ZIP/RAR)
+    2. subs.ro — AJAX search with antispam token, ZIP download
+    3. subtitrari-noi.ro — detail page ZIP (currently dead)
+
+    Returns True on successful download.
+    """
+    _v(f"Romanian subtitle sites: query={query} tmdb_id={tmdb_id}")
+    import urllib.request
+    import urllib.parse
+    import json
+    import re
+    import tempfile
+    import zipfile
+    import io
+    import http.cookiejar
+
+    _ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+    # 1. titrari.ro via IMDB ID (needs PHPSESSID cookie)
+    if tmdb_api_key and tmdb_id:
+        _vv("  trying titrari.ro via IMDB ID...")
+        try:
+            url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}"
+            req = urllib.request.Request(url, headers={"User-Agent": _ua})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                md = json.loads(resp.read())
+            imdb_id = md.get("imdb_id", "")
+            imdb_num = imdb_id.replace("tt", "") if imdb_id else ""
+            _vv(f"  IMDB ID: {imdb_id}")
+            if imdb_num:
+                cj = http.cookiejar.CookieJar()
+                opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+                opener.addheaders = [("User-Agent", _ua)]
+                opener.open(urllib.request.Request("https://titrari.ro/"), timeout=10).close()
+                detail_url = f"https://titrari.ro/index.php?page=cautamainaltaparte&z8=1&z5={imdb_num}"
+                _vv(f"  fetching detail page: {detail_url}")
+                req2 = urllib.request.Request(detail_url, headers={"Referer": "https://titrari.ro/"})
+                with opener.open(req2, timeout=30) as resp2:
+                    html = resp2.read().decode("utf-8", errors="replace")
+                dl_ids = re.findall(r'href=get\.php\?id=(\d+)', html)
+                _vv(f"  found {len(dl_ids)} download IDs")
+                for dl_id in dl_ids[:5]:
+                    _vv(f"    trying dl_id={dl_id}")
+                    dl_headers = {"Referer": detail_url}
+                    req3 = urllib.request.Request(
+                        f"https://titrari.ro/get.php?id={dl_id}", headers=dl_headers
+                    )
+                    with opener.open(req3, timeout=60) as resp3:
+                        content = resp3.read()
+                    if not content or len(content) < 100:
+                        continue
+                    srt_data = None
+                    if content[:1] == b'1' and b'-->' in content[:200]:
+                        srt_data = content
+                    elif content[:2] == b'PK':
+                        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                            for name in zf.namelist():
+                                if name.lower().endswith('.srt'):
+                                    srt_data = zf.read(name)
+                                    break
+                    elif content[:4] == b'Rar!' or b'Rar!' in content[:100]:
+                        extract_dir = tempfile.mkdtemp(prefix=f"titrari_{dl_id}_")
+                        rar_path = Path(extract_dir) / f"{dl_id}.rar"
+                        try:
+                            rar_path.write_bytes(content)
+                            subprocess.run(
+                                ["unrar", "e", str(rar_path), extract_dir],
+                                capture_output=True, timeout=30
+                            )
+                            for f in Path(extract_dir).iterdir():
+                                if f.suffix.lower() == '.srt' and f.stat().st_size > 100:
+                                    srt_data = f.read_bytes()
+                                    break
+                        finally:
+                            shutil.rmtree(extract_dir, ignore_errors=True)
+                    if srt_data and len(srt_data) > 100:
+                        dest.write_bytes(srt_data)
+                        return True
+        except Exception:
+            pass
+
+    # 2. Try subs.ro (AJAX search + ZIP download)
+    _vv("  trying subs.ro...")
+    try:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = [("User-Agent", _ua)]
+
+        # Step 2a: Get antispam token from search page
+        search_url = f"https://subs.ro/cautare?termen-general={urllib.parse.quote(query)}"
+        _vv(f"  subs.ro search: {search_url}")
+        req = urllib.request.Request(search_url, headers={"Referer": "https://subs.ro/subtitrari/"})
+        with opener.open(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        antispam = None
+        m = re.search(r'name="antispam" value="([^"]+)"', html)
+        if m:
+            antispam = m.group(1)
+        _vv(f"  antispam token: {antispam}")
+        if not antispam:
+            _vv("  no antispam token, skipping subs.ro")
+            raise RuntimeError("no antispam token")
+
+        # Step 2b: AJAX search for download links
+        data = urllib.parse.urlencode({
+            "termen-general": query, "type": "subtitrari", "antispam": antispam
+        }).encode()
+        req2 = urllib.request.Request(
+            "https://subs.ro/ajax/search",
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": search_url,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+        )
+        with opener.open(req2, timeout=15) as resp2:
+            ajax_html = resp2.read().decode("utf-8", errors="replace")
+        dl_links = re.findall(r'href="([^"]*descarca[^"]*)"', ajax_html)
+
+        # Step 2c: Download ZIP and extract .srt
+        for link in dl_links[:3]:
+            if not link.startswith("http"):
+                link = "https://subs.ro" + ("/" if not link.startswith("/") else "") + link
+            detail_url = link.replace("/descarca/", "/")
+            req3 = urllib.request.Request(link, headers={"Referer": detail_url})
+            with opener.open(req3, timeout=60) as resp3:
+                content = resp3.read()
+            if len(content) < 100 or content[:2] != b'PK':
+                continue
+            best = None
+            best_size = 0
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                for name in zf.namelist():
+                    if name.lower().endswith('.srt'):
+                        info = zf.getinfo(name)
+                        if info.file_size > best_size:
+                            best = (name, zf.read(name))
+                            best_size = info.file_size
+            if best:
+                dest.write_bytes(best[1])
+                return True
+    except Exception:
+        pass
+
+    # 3. Try subtitrari-noi.ro via detail page ID
+    _vv("  trying subtitrari-noi.ro...")
+    try:
+        base_url = "https://www.subtitrari-noi.ro"
+        search_url = f"{base_url}/?s={urllib.parse.quote(query)}"
+        _vv(f"  search: {search_url}")
+        req = urllib.request.Request(search_url, headers={"User-Agent": _ua})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        # Find detail page links (format: Subtitrari-{year}/{title}/{id})
+        detail_ids = re.findall(r'/Subtitrari-\d{4}/[^"\'/]+/(\d+)', html)
+        _vv(f"  found {len(detail_ids)} detail IDs")
+        for detail_id in detail_ids[:10]:
+            try:
+                detail_url = f"{base_url}/index.php?page=movie_details&act=1&id={detail_id}"
+                req2 = urllib.request.Request(detail_url, headers={"User-Agent": _ua})
+                with urllib.request.urlopen(req2, timeout=15) as resp2:
+                    detail_html = resp2.read().decode("utf-8", errors="replace")
+                zip_links = re.findall(r'href=["\']([^"\']*\.zip)["\']', detail_html, re.I)
+                for zlink in zip_links[:3]:
+                    full_zip = zlink if zlink.startswith("http") else f"{base_url}{zlink}"
+                    req3 = urllib.request.Request(full_zip, headers={"User-Agent": _ua})
+                    with urllib.request.urlopen(req3, timeout=60) as resp3:
+                        content = resp3.read()
+                    if len(content) > 100:
+                        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                            for name in zf.namelist():
+                                if name.lower().endswith('.srt'):
+                                    with zf.open(name) as srt_file:
+                                        dest.write_bytes(srt_file.read())
+                                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 4. titrari.ro legacy search (via /cauta/ path — often 404)
+    _vv("  trying titrari.ro legacy search...")
+    try:
+        base_url = "https://www.titrari.ro"
+        for path in [f"/cauta/{urllib.parse.quote(query)}", f"/search/{urllib.parse.quote(query)}"]:
+            req = urllib.request.Request(f"{base_url}{path}", headers={"User-Agent": _ua})
+            try:
+                _vv(f"  fetching {path}")
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+                srt_links = re.findall(r'(/ro/downloads/[^"\']+\.srt)', html)
+                _vv(f"  found {len(srt_links)} SRT links")
+                for rel_path in srt_links[:3]:
+                    full_url = f"{base_url}{rel_path}"
+                    _vv(f"    downloading {full_url}")
+                    dl_req = urllib.request.Request(full_url, headers={"User-Agent": _ua})
+                    with urllib.request.urlopen(dl_req, timeout=60) as dl_resp:
+                        srt_content = dl_resp.read()
+                    if len(srt_content) > 100:
+                        _vv(f"    OK ({len(srt_content)} bytes)")
+                        dest.write_bytes(srt_content)
+                        return True
+            except Exception as e:
+                _vv(f"    {path} failed: {e}")
+                continue
+    except Exception:
+        pass
+
+    return False
 
 def _has_english_subtitle(video_path: Path) -> bool:
     try:
@@ -410,8 +686,10 @@ def _find_embedded_subs(video_path: Path, *, mkvmerge_exe: str | None) -> tuple[
 
 def _remux_keep_sub_track(video_path: Path, *, track_id: int, mkvmerge_exe: str | None) -> bool:
     """Remux keeping video, audio, and only the specified subtitle track."""
+    _v(f"Remux keep sub track_id={track_id}: {video_path.name}")
     exe = mkvmerge_exe or shutil.which("mkvmerge")
     if not exe:
+        _vv("  mkvmerge not found")
         return False
     # Skip remux if target sub is the only sub track
     try:
@@ -495,23 +773,33 @@ def _detect_srt_encoding(raw: bytes) -> str | None:
     return best_text if best_text is not None else raw.decode("latin-1", errors="replace")
 
 def fix_srt_file(srt_path: Path) -> bool:
+    _v(f"Fix SRT encoding: {srt_path.name}")
     try: raw = srt_path.read_bytes()
-    except OSError: return False
+    except OSError:
+        _vv("  read error")
+        return False
     text = _detect_srt_encoding(raw)
-    if text is None: return False
+    if text is None:
+        _vv("  encoding detection failed")
+        return False
+    _vv(f"  raw size={len(raw)} detected={len(text)} chars")
     text = RE_GARBAGE.sub("", text)
+    _vv(f"  after garbage strip={len(text)} chars")
     tmp = srt_path.with_name(srt_path.stem + ".tmpfix" + srt_path.suffix)
     if tmp.exists(): tmp = srt_path.with_name(srt_path.stem + ".tmpfix." + uuid.uuid4().hex + srt_path.suffix)
     try: tmp.write_bytes(codecs.BOM_UTF8 + text.encode("utf-8"))
-    except OSError: return False
+    except OSError:
+        _vv("  write error")
+        return False
     bak = srt_path.with_name(srt_path.stem + ".bak" + srt_path.suffix)
     bak.unlink(missing_ok=True)
     try: srt_path.rename(bak)
     except OSError: tmp.unlink(); return False
-    try: tmp.rename(srt_path); bak.unlink(); return True
+    try: tmp.rename(srt_path); bak.unlink(); _vv("  OK"); return True
     except OSError:
         tmp.unlink(missing_ok=True)
         if bak.exists(): bak.rename(srt_path)
+        _vv("  rename error")
         return False
 
 # ===========================================================================
@@ -519,35 +807,59 @@ def fix_srt_file(srt_path: Path) -> bool:
 # ===========================================================================
 
 def _cleanup_folder(folder: Path, root: Path) -> None:
-    if not folder.is_dir(): return
+    if not folder.is_dir():
+        _vv(f"  cleanup skip: {folder} not a dir")
+        return
+    _v(f"Cleanup folder: {folder.name}")
+    removed = renamed_video = renamed_subs = 0
     for fp in list(folder.iterdir()):
         if is_own_file(fp, root): continue
         if fp.is_file():
-            if fp.suffix.lower() in JUNK_EXTENSIONS: fp.unlink(missing_ok=True); continue
+            if fp.suffix.lower() in JUNK_EXTENSIONS:
+                fp.unlink(missing_ok=True); removed += 1
+                _vv(f"  removed junk: {fp.name}")
+                continue
             if fp.stem.lower().startswith("sample") and fp.suffix.lower() in (VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS):
-                fp.unlink(missing_ok=True); continue
-        elif fp.is_dir() and fp.name.lower() in JUNK_DIRS: shutil.rmtree(fp, ignore_errors=True)
+                fp.unlink(missing_ok=True); removed += 1
+                _vv(f"  removed sample: {fp.name}")
+                continue
+        elif fp.is_dir() and fp.name.lower() in JUNK_DIRS:
+            shutil.rmtree(fp, ignore_errors=True)
+            _vv(f"  removed junk dir: {fp.name}")
     fname = folder.name
     fv = next((fp for fp in sorted(folder.iterdir()) if fp.is_file() and not is_own_file(fp, root) and fp.suffix.lower() in VIDEO_EXTENSIONS), None)
     if fv is not None:
         t = fv.with_name(fname + fv.suffix)
         if fv.name != t.name and not t.exists():
-            try: fv.rename(t)
-            except OSError: pass
+            try:
+                fv.rename(t)
+                renamed_video += 1
+                _vv(f"  renamed video: {fv.name} -> {t.name}")
+            except OSError:
+                _vv(f"  rename video error: {fv.name}")
+                pass
     for fp in list(folder.iterdir()):
         if fp.is_file() and fp.suffix.lower() in SUBTITLE_EXTENSIONS:
             t = fp.with_name(fname + fp.suffix)
             if fp.name != t.name and not t.exists():
-                try: fp.rename(t)
-                except OSError: pass
+                try:
+                    fp.rename(t)
+                    renamed_subs += 1
+                    _vv(f"  renamed sub: {fp.name} -> {t.name}")
+                except OSError:
+                    _vv(f"  rename sub error: {fp.name}")
+                    pass
+    _v(f"  Folder {folder.name}: removed {removed}, renamed {renamed_video} video(s), {renamed_subs} sub(s)")
 
 def _flatten_folders(root: Path, dry_run: bool = False) -> int:
+    _v(f"Flatten folders: root={root} dry_run={dry_run}")
     moved = 0
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             continue
         if child.name.startswith("."):
             continue
+        _vv(f"  checking: {child.name}")
         vids = [fp for ext in VIDEO_EXTENSIONS for fp in child.glob(f"*{ext}")] + \
                [fp for ext in VIDEO_EXTENSIONS for fp in child.glob(f"*{ext.upper()}")]
         srt_files = list(child.glob("*.srt")) + list(child.glob("*.SRT"))
@@ -636,6 +948,8 @@ def opensubtitles_download(query: str, dest: Path, *, api_key: str, lang: str = 
     if len(blob) < 50: return False
     try: dest.write_bytes(blob); return True
     except OSError: return False
+def _download_from_romanian_subtitles(query: str, dest: Path, *, lang: str = "romanian") -> bool:
+    return _download_from_romanian_subtitles_better(query, dest, lang=lang)
 
 def download_via_subliminal(video: Path, *, subliminal_exe: str, lang: str = "ro", opensubtitlescom_user: str = "", force: bool = False) -> bool:
     exe = resolve_subliminal_exe(subliminal_exe)
@@ -645,10 +959,13 @@ def download_via_subliminal(video: Path, *, subliminal_exe: str, lang: str = "ro
     if opensubtitlescom_user and pw: cmd.extend(["--opensubtitlescom", opensubtitlescom_user, pw])
     cmd.extend(["download", "-l", lang, "-s", str(video)])
     if force: cmd.append("-f")
+    # Tell subliminal to write directly to Processed/ instead of copying back
+    cmd.extend(["--output-dir", str(video.parent / "Processed")])
     try: return subprocess.run(cmd, timeout=300, capture_output=True).returncode == 0
     except subprocess.TimeoutExpired: return False
 
 def remux_series_video(video_path: Path, srt_path: Path, *, mkvmerge_exe: str | None, lang: str = "ro") -> bool:
+    _v(f"Remux: {video_path.name} + {srt_path.name} (lang={lang})")
     ext = video_path.suffix.lower()
     is_mkv = ext == ".mkv"
     use_mkvmerge = mkvmerge_exe is not None
@@ -666,6 +983,8 @@ def remux_series_video(video_path: Path, srt_path: Path, *, mkvmerge_exe: str | 
             cmd = [mkvmerge_exe, "-o", str(tmp), "-S", str(video_path), "--language", f"0:{lang}", "--track-name", f"0:{ff_lang_name}", str(srt_path)]
         else:
             cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(srt_path), "-map", "0:v", "-map", "0:a", "-map", "1", "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", "-metadata:s:s:0", f"language={mkv_lang}", "-metadata:s:s:0", f"title={ff_lang_name}", str(tmp)]
+        _log_cmd(cmd)
+        _vv("  running muxer (may take a while)...")
         proc = subprocess.run(cmd, capture_output=True, timeout=3600)
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip() or f"exited with {proc.returncode}")
@@ -842,10 +1161,19 @@ def tmdb_fetch_poster_jpg(api_key: str, title: str, year: str, dest: Path) -> bo
     except OSError: return False
 
 def fetch_movie_poster_open_sources(dest: Path, title: str, year: str, *, tmdb_key: str, omdb_key: str) -> tuple[bool, str]:
-    if tmdb_key and tmdb_fetch_poster_jpg(tmdb_key, title, year, dest): return True, "TMDB"
-    if omdb_key and omdb_fetch_poster_jpg(omdb_key, title, year, dest): return True, "OMDb"
-    if cinemeta_fetch_poster_jpg(title, year, dest): return True, "Cinemeta"
-    if itunes_fetch_poster_jpg(title, year, dest): return True, "iTunes"
+    _v(f"Fetch poster: {title} ({year})")
+    if tmdb_key and tmdb_fetch_poster_jpg(tmdb_key, title, year, dest):
+        _vv("  TMDB OK"); return True, "TMDB"
+    _vv("  TMDB failed")
+    if omdb_key and omdb_fetch_poster_jpg(omdb_key, title, year, dest):
+        _vv("  OMDb OK"); return True, "OMDb"
+    _vv("  OMDb failed")
+    if cinemeta_fetch_poster_jpg(title, year, dest):
+        _vv("  Cinemeta OK"); return True, "Cinemeta"
+    _vv("  Cinemeta failed")
+    if itunes_fetch_poster_jpg(title, year, dest):
+        _vv("  iTunes OK"); return True, "iTunes"
+    _vv("  iTunes failed")
     return False, ""
 
 def _tmdb_search_result_score(rough_title: str, year_s: str, r: dict) -> float:
@@ -870,15 +1198,22 @@ def _tmdb_search_result_score(rough_title: str, year_s: str, r: dict) -> float:
     return score
 
 def tmdb_resolve_movie_title_year_and_id(api_key: str, rough_title: str, year: str | None = None) -> tuple[str, str, int] | None:
-    if not (api_key or "").strip(): return None
+    _v(f"TMDB resolve: '{rough_title}' year={year}")
+    if not (api_key or "").strip():
+        _vv("  no API key")
+        return None
     year_s = (year or "").strip()
     key_q = urllib.parse.quote(api_key.strip(), safe="")
     q = urllib.parse.quote(rough_title)
     url = f"https://api.themoviedb.org/3/search/movie?api_key={key_q}&query={q}"
     if year_s: url += f"&year={year_s}"
+    _vv(f"  searching TMDB...")
     try: data = _http_get_json(url, timeout=30)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError): return None
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        _vv(f"  TMDB search error: {e}")
+        return None
     results = data.get("results") or []
+    _vv(f"  {len(results)} result(s)")
     best: dict | None = None
     for r in results:
         if year_s and str(r.get("release_date") or "").startswith(year_s): best = r; break
@@ -889,20 +1224,32 @@ def tmdb_resolve_movie_title_year_and_id(api_key: str, rough_title: str, year: s
             scored = [(_tmdb_search_result_score(rough_title, year_s, r), r) for r in pool]
             scored.sort(key=lambda t: t[0], reverse=True)
             best = scored[0][1]
-    if not best: return None
+    if not best:
+        _vv(f"  no match found")
+        return None
     mid = best.get("id")
     if mid is None: return None
     mid_int = int(mid)
+    _vv(f"  best match: id={mid_int} title={best.get('title')}")
     try: detail = _http_get_json(f"https://api.themoviedb.org/3/movie/{mid_int}?api_key={key_q}&language=en-US", timeout=30)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError): return None
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        _vv(f"  detail fetch failed")
+        return None
     name = detail.get("title") or detail.get("original_title")
-    if not name or not isinstance(name, str): return None
+    if not name or not isinstance(name, str):
+        _vv(f"  no name in detail")
+        return None
     cleaned = clean_title_for_fs(name.strip())
-    if not cleaned: return None
+    if not cleaned:
+        _vv(f"  cleaned name empty")
+        return None
     rd = str(detail.get("release_date") or best.get("release_date") or "")
     release_year = rd[:4] if re.match(r"^\d{4}", rd) else (year_s or None)
-    if not release_year: return None
+    if not release_year:
+        _vv(f"  no release year")
+        return None
     tid = detail.get("id")
+    _vv(f"  resolved: {cleaned} ({release_year}) id={tid or mid_int}")
     return cleaned, release_year, int(tid) if tid is not None else mid_int
 
 def tmdb_resolve_movie_title_and_id(api_key: str, rough_title: str, year: str) -> tuple[str, int] | None:
@@ -927,16 +1274,33 @@ def _opensubtitles_com_headers(os_api_key: str) -> dict[str, str]:
     return {"User-Agent": OPENSUBTITLES_COM_USER_AGENT, "Api-Key": os_api_key.strip(), "Accept": "application/json"}
 
 def opensubtitles_com_download_romanian_srt(consumer_api_key: str, tmdb_movie_id: int, dest_srt: Path) -> bool:
-    if not consumer_api_key.strip(): return False
+    """Download Romanian subtitle from OpenSubTitles.com API.
+
+    Uses TMDB movie ID to find the subtitle.
+    Returns True on successful download.
+    """
+    _v(f"OS.com download: tmdb_id={tmdb_movie_id} -> {dest_srt.name}")
+    if not consumer_api_key.strip():
+        _vv("  no API key")
+        return False
     q = urllib.parse.urlencode({"languages": "ro", "tmdb_id": str(tmdb_movie_id), "order_by": "download_count", "order_direction": "desc"})
+    _vv(f"  searching OS.com for tmdb_id={tmdb_movie_id}...")
     try:
         req = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/subtitles?{q}", headers=_opensubtitles_com_headers(consumer_api_key))
         with urllib.request.urlopen(req, timeout=45) as resp: data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError): return False
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        _vv(f"  search error: {e}")
+        return False
     items = data.get("data") or []
-    if not items: return False
+    _vv(f"  found {len(items)} subtitle(s)")
+    if not items:
+        _vv(f"  no subtitles found")
+        return False
     file_id = next((int(files[0]["file_id"]) for item in items for files in [(item.get("attributes") or {}).get("files") or []] if files and files[0].get("file_id") is not None), None)
-    if file_id is None: return False
+    if file_id is None:
+        _vv(f"  no file_id found")
+        return False
+    _vv(f"  file_id={file_id}")
     try:
         dreq = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/download", data=json.dumps({"file_id": file_id}).encode("utf-8"), method="POST", headers={**_opensubtitles_com_headers(consumer_api_key), "Content-Type": "application/json"})
         with urllib.request.urlopen(dreq, timeout=45) as resp: dresp = json.loads(resp.read().decode("utf-8"))
@@ -956,8 +1320,11 @@ def opensubtitles_com_try_romanian_for_videos(videos_with_tmdb: list[tuple[Path,
     ok = 0
     for video, tmdb_mid in videos_with_tmdb:
         if tmdb_mid is None: continue
+        # When organizing movies, dest is in source folder
+        # We want to check if subtitle exists in destination (Processed/ folder)
         dest = video.with_suffix(".srt")
         if dest.is_file(): continue
+        # Download to source location for check, but will be moved later
         if opensubtitles_com_download_romanian_srt(key, tmdb_mid, dest): ok += 1
     return ok
 
@@ -977,49 +1344,65 @@ def iter_loose_movie_files(root: Path) -> list[Path]:
     return out
 
 def organize_loose_videos_in_root(root: Path, *, tmdb_api_key: str = "", omdb_api_key: str = "", auto_fetch_ro_subtitles: bool = True, subliminal_exe: str = "", opensubtitlescom_user: str = "") -> None:
+    t0 = _timer_start()
+    _v(f"organize_loose_videos_in_root: root={root}")
     tmdb_k = (tmdb_api_key or os.environ.get("PROCESS_MOVIES_TMDB_API_KEY", "") or _DEFAULT_TMDB_API_KEY).strip()
     omdb_k = (omdb_api_key or os.environ.get("PROCESS_MOVIES_OMDB_API_KEY", "") or _DEFAULT_OMDB_API_KEY).strip()
+    _v(f"TMDB key={'set' if tmdb_k else 'NOT set'}, OMDB key={'set' if omdb_k else 'NOT set'}")
     _heading("Step 0 - Sort loose movie files into folders")
     loose = list(iter_loose_movie_files(root))
+    _v(f"Found {len(loose)} loose movie file(s)")
     if not loose: _bullet("No loose movie files found."); return
     moved = pattern_misses = skipped = posters = 0
     videos_with_tmdb: list[tuple[Path, int | None]] = []
-    for fp in loose:
+    for i, fp in enumerate(loose):
+        _v(f"[{i+1}/{len(loose)}] {fp.name}")
         set_window_title(f"Organize: {fp.name}")
         orig_stem = fp.stem
         parsed = parse_loose_movie_stem(orig_stem)
-        if parsed: title, year = parsed
+        if parsed: title, year = parsed; _vv(f"  parsed as: {title} ({year})")
         else:
             pd = parse_loose_release_year_stem(orig_stem)
-            if pd: title, year = pd
+            if pd: title, year = pd; _vv(f"  release-year parse: {title} ({year})")
             else:
                 guessed = guess_loose_title_without_year(orig_stem)
-                if not guessed: pattern_misses += 1; continue
+                if not guessed: pattern_misses += 1; _vv(f"  UNRECOGNIZED"); continue
                 title, year = guessed, ""
+                _vv(f"  guessed: {title}")
         tm_mid = None
         tr = tmdb_resolve_movie_title_year_and_id(tmdb_k, title, year or None)
-        if tr: title, year, tm_mid = tr
-        elif year: cx = cinemeta_lookup_canonical_title(title, year); title = cx if cx else title
-        else: pattern_misses += 1; continue
+        if tr:
+            title, year, tm_mid = tr
+            _vv(f"  TMDB resolved: {title} ({year}) id={tm_mid}")
+        elif year:
+            cx = cinemeta_lookup_canonical_title(title, year); title = cx if cx else title
+            _vv(f"  Cinemeta resolved: {title} ({year})")
+        else:
+            pattern_misses += 1; _vv(f"  NO TMDB match"); continue
         folder_name = f"{year} - {title}"
         dest_dir = root / folder_name
         dest_video = dest_dir / f"{title}{fp.suffix.lower()}"
-        if dest_video.exists() and dest_video.resolve() != fp.resolve(): skipped += 1; videos_with_tmdb.append((dest_video, tm_mid)); continue
+        _vv(f"  dest: {dest_dir.name}/{dest_video.name}")
+        if dest_video.exists() and dest_video.resolve() != fp.resolve():
+            skipped += 1
+            _vv(f"  EXISTS, skipping")
+            videos_with_tmdb.append((dest_video, tm_mid))
+            continue
         dest_dir.mkdir(parents=False, exist_ok=True)
         old_parent = fp.parent
-        sidecar = fp.parent / f"{orig_stem}.srt"
-        dest_srt_path = dest_dir / f"{title}.srt"
         try:
-            if dest_video.resolve() != fp.resolve(): fp.rename(dest_video); moved += 1
-        except OSError: skipped += 1; continue
-        if sidecar.is_file() and not dest_srt_path.exists():
-            try: sidecar.rename(dest_srt_path)
-            except OSError: pass
+            if dest_video.resolve() != fp.resolve():
+                fp.rename(dest_video); moved += 1
+                _vv(f"  moved video -> {dest_video.name}")
+        except OSError:
+            _vv(f"  MOVE ERROR"); skipped += 1; continue
         if old_parent != root and old_parent.is_dir() and old_parent.resolve() != dest_dir.resolve() and not any(old_parent.iterdir()):
-            try: old_parent.rmdir()
+            try: old_parent.rmdir(); _vv(f"  removed old dir: {old_parent.name}")
             except OSError: pass
         poster_path = dest_dir / "poster.jpg"
-        if not poster_path.exists() and fetch_movie_poster_open_sources(poster_path, title, year, tmdb_key=tmdb_k, omdb_key=omdb_k): posters += 1
+        if not poster_path.exists() and fetch_movie_poster_open_sources(poster_path, title, year, tmdb_key=tmdb_k, omdb_key=omdb_k):
+            posters += 1
+            _vv(f"  downloaded poster")
         videos_with_tmdb.append((dest_video, tm_mid))
     _bullet(f"Moved: {moved}, unrecognized: {pattern_misses}, skipped: {skipped}, posters: {posters}")
     filtered = [(vp, mid) for vp, mid in videos_with_tmdb if vp.is_file() and not _has_romanian_subtitle(vp)]
@@ -1031,45 +1414,277 @@ def organize_loose_videos_in_root(root: Path, *, tmdb_api_key: str = "", omdb_ap
         _heading("Step 0c - OpenSubtitles.com API")
         opensubtitles_com_try_romanian_for_videos(filtered, consumer_api_key=os_rest_key)
 
+def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_key: str = "", auto_fetch_ro_subtitles: bool = True, subliminal_exe: str = "", opensubtitlescom_user: str = "", mkvmerge_exe: str | None = None) -> None:
+    """Copy movies to Processed/<year> - <title>/ without touching originals.
+
+    Non-destructive: reads from root, writes to root/Processed/.
+    Each movie gets its own folder with video, poster, and Romanian subtitle.
+    """
+    t0 = _timer_start()
+    _v(f"organize_loose_to_processed: root={root}")
+    tmdb_k = (tmdb_api_key or os.environ.get("PROCESS_MOVIES_TMDB_API_KEY", "") or _DEFAULT_TMDB_API_KEY).strip()
+    omdb_k = (omdb_api_key or os.environ.get("PROCESS_MOVIES_OMDB_API_KEY", "") or _DEFAULT_OMDB_API_KEY).strip()
+    os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+    _v(f"TMDB={'set' if tmdb_k else 'NOT SET'}, OMDB={'set' if omdb_k else 'NOT SET'}, OS_API={'set' if os_api_key else 'NOT SET'}")
+    _heading("Process movies to Processed/ (non-destructive)")
+    loose = list(iter_loose_movie_files(root))
+    _v(f"Found {len(loose)} loose movie file(s)")
+    if not loose:
+        _bullet("No loose movie files found.")
+        return
+    processed_dir = root / "Processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    _v(f"Processed dir: {processed_dir}")
+    copied = pattern_misses = skipped = posters = subs = srt_fixed = remuxed_count = 0
+    need_subs: list[tuple[Path, int | None]] = []
+    for i, fp in enumerate(loose):
+        _v(f"[{i+1}/{len(loose)}] {fp.name}")
+        set_window_title(f"Process: {fp.name}")
+        orig_stem = fp.stem
+        parsed = parse_loose_movie_stem(orig_stem)
+        if parsed:
+            title, year = parsed
+            _vv(f"  parsed: {title} ({year})")
+        else:
+            pd = parse_loose_release_year_stem(orig_stem)
+            if pd:
+                title, year = pd
+                _vv(f"  release-year parse: {title} ({year})")
+            else:
+                guessed = guess_loose_title_without_year(orig_stem)
+                if not guessed:
+                    pattern_misses += 1
+                    _bullet(f"  ? {fp.name} \u2014 unrecognized")
+                    continue
+                title, year = guessed, ""
+                _vv(f"  guessed: {title}")
+        tm_mid = None
+        tr = tmdb_resolve_movie_title_year_and_id(tmdb_k, title, year or None)
+        if tr:
+            title, year, tm_mid = tr
+            _vv(f"  TMDB: {title} ({year}) id={tm_mid}")
+        elif year:
+            cx = cinemeta_lookup_canonical_title(title, year)
+            title = cx if cx else title
+            _vv(f"  Cinemeta: {title} ({year})")
+        else:
+            pattern_misses += 1
+            _bullet(f"  ? {fp.name} \u2014 no TMDB match")
+            continue
+        folder_name = f"{year} - {title}"
+        dest_dir = processed_dir / folder_name
+        dest_video = dest_dir / f"{title}{fp.suffix.lower()}"
+        dest_srt = dest_dir / f"{title}.srt"
+        _vv(f"  dest_folder={folder_name}")
+        if dest_video.exists():
+            _bullet(f"  = {folder_name} \u2014 exists")
+            _vv(f"  video exists: {dest_video.name}")
+        else:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(fp, dest_video)
+                copied += 1
+                _bullet(f"  + {folder_name}")
+                _vv(f"  copied: {fp.name} ({fp.stat().st_size / 1024 / 1024:.1f} MB)")
+            except OSError as e:
+                skipped += 1
+                _bullet(f"  ! {fp.name} \u2014 copy error: {e}")
+                continue
+        # Download poster
+        poster_path = dest_dir / "poster.jpg"
+        if not poster_path.exists():
+            if fetch_movie_poster_open_sources(poster_path, title, year, tmdb_key=tmdb_k, omdb_key=omdb_k):
+                posters += 1
+                _vv(f"  poster downloaded")
+            else:
+                _vv(f"  poster download failed")
+        # Track for subtitle download
+        has_ro = _has_romanian_subtitle_sidecar(dest_video)
+        _vv(f"  has_romanian_subtitle={has_ro}, dest_srt_exists={dest_srt.exists()}")
+        if auto_fetch_ro_subtitles and not dest_srt.exists() and not has_ro:
+            need_subs.append((dest_video, tm_mid))
+    # Batch subtitle download
+    if auto_fetch_ro_subtitles and need_subs:
+        _bullet(f"Fetching subtitles for {len(need_subs)} movie(s)...")
+        _v(f"Subtitle download phase: {len(need_subs)} need subs")
+        pre_subs = subs
+        # Phase 1: OpenSubtitles API for movies with TMDB IDs
+        _v(f"Phase 1: OpenSubtitles.com API via TMDB ID")
+        for p, tm_mid in need_subs:
+            if tm_mid and os_api_key:
+                srt_path = p.with_suffix(".srt")
+                _vv(f"  trying OS.com for {p.name} (TMDB id={tm_mid})")
+                if not srt_path.exists() and opensubtitles_com_download_romanian_srt(os_api_key, tm_mid, srt_path):
+                    subs += 1
+                    _vv(f"  OS.com download OK")
+                    if fix_srt_file(srt_path):
+                        srt_fixed += 1
+                else:
+                    _vv(f"  OS.com download failed")
+        # Phase 2: subliminal for remaining
+        still_needed = [p for p, _ in need_subs if not p.with_suffix(".srt").exists()]
+        _v(f"Phase 2: subliminal ({len(still_needed)} still needed)")
+        if still_needed:
+            sub_exe = resolve_subliminal_exe(subliminal_exe)
+            if sub_exe:
+                fps = [p for p in still_needed if p.is_file()]
+                if fps:
+                    com_user = (opensubtitlescom_user or os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_USER", "") or _DEFAULT_OPENSUBTITLES_COM_LOGIN_USER).strip()
+                    com_pw = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_PASSWORD", "") or _DEFAULT_OPENSUBTITLES_COM_LOGIN_PASSWORD).strip()
+                    cmd: list[str] = [sub_exe]
+                    if com_user and com_pw:
+                        cmd.extend(["--opensubtitlescom", com_user, com_pw])
+                    cmd.extend(["download", "-l", "ro"])
+                    if tmdb_k:
+                        cmd.extend(["-rr", "tmdb"])
+                    cmd.extend(["-p", "opensubtitlescom", "-pp", "podnapisi"])
+                    cmd.extend(["-s"] + [str(p) for p in fps])
+                    _log_cmd(cmd)
+                    _vv(f"  running subliminal for {len(fps)} file(s)...")
+                    try:
+                        proc = subprocess.run(cmd, timeout=3*3600, capture_output=True)
+                        log = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+                        _vv(f"  subliminal stdout ({len(log)} chars)")
+                        if log:
+                            for line in log.splitlines():
+                                if "Downloaded" in line or "Skipped" in line or "Error" in line.lower() or "WARNING" in line:
+                                    _indent(line)
+                                elif "[E]" in line:
+                                    _indent(line)
+                    except subprocess.TimeoutExpired:
+                        _bullet(f"  ! subliminal timed out")
+                # Count newly downloaded subs
+                for p in fps:
+                    srt_path = p.with_suffix(".srt")
+                    if srt_path.exists() and srt_path.stat().st_size > 50:
+                        subs += 1
+                        _vv(f"  subliminal downloaded: {srt_path.name}")
+                        if fix_srt_file(srt_path):
+                            srt_fixed += 1
+                    else:
+                        _vv(f"  subliminal no sub for: {p.name}")
+        # Phase 3: Romanian sites (pass TMDB ID for titrari.ro)
+        _v(f"Phase 3: Romanian subtitle sites ({len([1 for p,_ in need_subs if not p.with_suffix('.srt').exists()])} still needed)")
+        for p, tm_mid in need_subs:
+            srt_path = p.with_suffix(".srt")
+            if srt_path.exists():
+                continue
+            query = p.stem
+            _vv(f"  trying Romanian sites for: {query}")
+            if _download_from_romanian_subtitles_better(query, srt_path, tmdb_api_key=tmdb_k, tmdb_id=tm_mid):
+                subs += 1
+                _vv(f"  Romanian site download OK")
+                if fix_srt_file(srt_path):
+                    srt_fixed += 1
+                _bullet(f"  ~ Romanian: {srt_path.name}")
+            else:
+                _vv(f"  Romanian sites failed")
+        if subs > pre_subs:
+            _bullet(f"  downloaded {subs - pre_subs} subtitle(s)")
+    # Remux: embed .srt into MKV where possible
+    remuxed_count = 0
+    if mkvmerge_exe:
+        _v(f"Remux phase: scanning for video files in Processed/")
+        remuxable = sorted(processed_dir.rglob("*.[mM][kK][vv]")) + sorted(processed_dir.rglob("*.[mM][pP]4"))
+        _v(f"  Found {len(remuxable)} video file(s) to check")
+        for vp in remuxable:
+            srtp = vp.with_suffix(".srt")
+            _vv(f"  checking: {vp.name} (srt_exists={srtp.is_file()})")
+            if not srtp.is_file():
+                _vv(f"    no sidecar SRT, skipping")
+                continue
+            if _has_romanian_subtitle(vp):
+                _vv(f"    already has embedded RO sub, skipping")
+                continue
+            if remux_series_video(vp, srtp, mkvmerge_exe=mkvmerge_exe):
+                remuxed_count += 1
+                _bullet(f"  ~ remuxed: {vp.parent.name}/{vp.name}")
+        if remuxed_count:
+            _bullet(f"Remuxed {remuxed_count} file(s)")
+        else:
+            _v("  No files remuxed")
+    _timer_elapsed(t0, "organize_loose_to_processed")
+    _heading("Summary")
+    _bullet(f"Copied: {copied}, unrecognized: {pattern_misses}, skipped: {skipped}")
+    _bullet(f"Posters: {posters}, subtitles: {subs}, SRT fixed: {srt_fixed}, remuxed: {remuxed_count}")
+
 # ===========================================================================
 # Movies: Steps 1-3 (rename folders, rename files, clean)
 # ===========================================================================
 
 def rename_folders(root: Path) -> None:
+    _v(f"rename_folders: root={root}")
     folders = []
     for dirpath, dirnames, _ in os.walk(root):
         for d in dirnames: folders.append(Path(dirpath) / d)
     folders.sort(key=lambda p: len(p.parts), reverse=True)
+    _v(f"  Found {len(folders)} total folders")
     renamed = 0
     for folder in folders:
         set_window_title(f"Rename folder: {folder.name}")
         if not folder.exists(): continue
         m = RE_MOVIE_FOLDER.match(folder.name)
-        if not m: continue
+        if not m:
+            _vv(f"  skip {folder.name} (no match)")
+            continue
         new_path = folder.parent / f"{m.group(2)} - {m.group(1)}"
-        if new_path.exists(): continue
-        try: folder.rename(new_path); renamed += 1
-        except OSError: pass
+        if new_path.exists():
+            _vv(f"  skip {folder.name} -> {new_path.name} (exists)")
+            continue
+        _vv(f"  rename: {folder.name} -> {new_path.name}")
+        try:
+            folder.rename(new_path); renamed += 1
+            _vv(f"    OK")
+        except OSError:
+            # Fallback: try shell mv (WSL /mnt/ permission workaround)
+            import subprocess as _sp
+            try:
+                _sp.run(["mv", str(folder), str(new_path)], check=True, capture_output=True)
+                renamed += 1
+                _vv(f"    OK (shell mv)")
+            except Exception as e:
+                _vv(f"    FAILED: {e}")
+                pass
     _bullet(f"Renamed {renamed} folder(s)")
 
 def rename_media_files(root: Path) -> None:
+    _v(f"rename_media_files: root={root}")
     renamed = already_ok = errors = 0
     for dirpath, _, filenames in os.walk(root):
         dp = Path(dirpath)
         m = RE_YEAR_NAME_FOLDER.match(dp.name)
-        if not m: continue
+        if not m:
+            _vv(f"  skip dir {dp.name} (no year-name match)")
+            continue
+        if not os.access(dirpath, os.R_OK):
+            errors += 1
+            _vv(f"  no access: {dirpath}")
+            continue
         target_stem = m.group(2)
+        _vv(f"  dir: {dp.name} -> target_stem={target_stem}")
         for fname in filenames:
             set_window_title(f"Rename media: {fname}")
             fp = dp / fname
             ext = fp.suffix
-            if ext.lower() not in MEDIA_EXTENSIONS: continue
+            if ext.lower() not in MEDIA_EXTENSIONS:
+                _vv(f"    skip {fname} (not media)")
+                continue
             target_name = f"{target_stem}{ext}"
-            if fp.name == target_name: already_ok += 1; continue
+            if fp.name == target_name:
+                already_ok += 1
+                _vv(f"    {fname} already OK")
+                continue
             target_path = dp / target_name
-            if target_path.exists(): continue
-            try: fp.rename(target_path); renamed += 1
-            except OSError: errors += 1
+            if target_path.exists():
+                _vv(f"    {fname} -> {target_name} exists, skipping")
+                continue
+            try:
+                fp.rename(target_path)
+                renamed += 1
+                _vv(f"    {fname} -> {target_name}")
+            except OSError as e:
+                errors += 1
+                _vv(f"    error renaming {fname}: {e}")
     _bullet(f"Renamed: {renamed}, already ok: {already_ok}{', errors: ' + str(errors) if errors else ''}")
 
 def clean_files(root: Path) -> None:
@@ -1082,13 +1697,60 @@ def clean_files(root: Path) -> None:
             if is_own_file(fp, root): continue
             sl = fp.stem.lower()
             el = fp.suffix.lower()
-            if sl in JUNK_STEMS or (el in IMAGE_EXTENSIONS and fname.lower() != "poster.jpg"):
+            if sl in JUNK_STEMS or (el in IMAGE_EXTENSIONS and fname.lower() != "poster.jpg" and not sl.endswith("-poster")):
                 try: fp.unlink(); removed += 1
                 except OSError: pass
     _bullet(f"Removed {removed} file(s)")
 
-def convert_posters(root: Path, irfanview: str) -> None:
-    _bullet("Poster conversion not available (IrfanView is Windows-only)")
+FOLDER_NAME_RE = re.compile(r"^(?:\((\d{4})\)\s*)?(.+)$|^(\d{4})\s*[-–]\s*(.+)$")
+
+def _folder_title_year(folder: Path) -> tuple[str, str] | None:
+    name = folder.name.strip()
+    m = FOLDER_NAME_RE.match(name)
+    if m:
+        if m.group(1) and m.group(2): return m.group(2).strip(), m.group(1)
+        if m.group(3) and m.group(4): return m.group(4).strip(), m.group(3)
+    return None
+
+def convert_posters(root: Path, *, tmdb_api_key: str = "", omdb_api_key: str = "") -> None:
+    tmdb_k = (tmdb_api_key or os.environ.get("PROCESS_MOVIES_TMDB_API_KEY", "") or _DEFAULT_TMDB_API_KEY).strip()
+    omdb_k = (omdb_api_key or os.environ.get("PROCESS_MOVIES_OMDB_API_KEY", "") or _DEFAULT_OMDB_API_KEY).strip()
+    convert_exe = shutil.which("magick") or shutil.which("convert")
+    downloaded = 0; converted = 0; skipped = 0
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir(): continue
+        ty = _folder_title_year(folder)
+        if not ty: continue
+        title, year = ty
+        poster_jpg = folder / "poster.jpg"
+        # Rename existing *-poster.jpg → poster.jpg (TMM downloads this format)
+        if not poster_jpg.exists():
+            for f in folder.iterdir():
+                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS and f.stem.endswith("-poster"):
+                    try:
+                        f.rename(poster_jpg); skipped += 1; break
+                    except OSError:
+                        pass
+        if poster_jpg.exists(): continue
+        existing = None
+        for ext in IMAGE_EXTENSIONS:
+            fp = folder / f"poster{ext}"
+            if fp.exists(): existing = fp; break
+        if existing and existing.suffix.lower() == ".jpg":
+            continue
+        if tmdb_k or omdb_k:
+            if fetch_movie_poster_open_sources(poster_jpg, title, year, tmdb_key=tmdb_k, omdb_key=omdb_k):
+                downloaded += 1; _indent(f"{title} ({year}): poster downloaded")
+                continue
+        if existing and convert_exe:
+            jpg = existing.with_suffix(".jpg")
+            r = subprocess.run([convert_exe, str(existing), "-quality", "90", str(jpg)], capture_output=True, timeout=60)
+            if r.returncode == 0:
+                try: existing.unlink(); converted += 1; _indent(f"{existing.name} -> poster.jpg")
+                except OSError: pass
+            else: skipped += 1
+        else: skipped += 1
+    _bullet(f"Posters: {downloaded} downloaded, {converted} converted, {skipped} skipped/missing")
 
 # ===========================================================================
 # Movies: Step 5 - Fix subtitles (full cleaning)
@@ -1224,13 +1886,23 @@ def _mkv_needs_remux(info: dict, keep_audio_ids: list[int], sidecar_srt: Path | 
     if sidecar_srt is not None: return not sub_ids or set(sub_ids) != set(ro_ids) or len(ro_ids) != 1
     return set(sub_ids) != set(ro_ids)
 
-def _mkv_remux_strip(mkv_path: Path, audio_ids: list[int], sidecar_srt: Path | None, romanian_sub_ids: list[int], *, mkvmerge_exe: str) -> None:
+def _mkv_remux_strip(mkv_path: Path, audio_ids: list[int], sidecar_srt: Path | None, romanian_sub_ids: list[int], *, mkvmerge_exe: str, output_path: Path | None = None) -> None:
+    """Remux mkv_path writing to output_path (or in-place if output_path is None).
+
+    When output_path is set, original files are never touched — the remuxed
+    file lands at output_path and anything temporary lives beside it.
+    """
+    _v(f"MKV remux strip: {mkv_path.name} -> {output_path or 'in-place'}")
     is_mkv = mkv_path.suffix.lower() == ".mkv"
     out_suffix = ".mkv"
-    out_tmp = mkv_path.with_name(mkv_path.stem + ".mkvstrip.tmp" + out_suffix)
-    if out_tmp.exists(): out_tmp = mkv_path.with_name(mkv_path.stem + ".mkvstrip.tmp." + uuid.uuid4().hex + out_suffix)
-    bak = mkv_path.with_name(mkv_path.stem + ".mkvstrip.bak" + mkv_path.suffix)
-    bak.unlink(missing_ok=True)
+    inplace = output_path is None
+    if inplace:
+        out_tmp = mkv_path.with_name(mkv_path.stem + ".mkvstrip.tmp" + out_suffix)
+        if out_tmp.exists(): out_tmp = mkv_path.with_name(mkv_path.stem + ".mkvstrip.tmp." + uuid.uuid4().hex + out_suffix)
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out_tmp = output_path.with_name(output_path.stem + ".tmp" + out_suffix)
+        if out_tmp.exists(): out_tmp = output_path.with_name(output_path.stem + ".tmp." + uuid.uuid4().hex + out_suffix)
     if is_mkv:
         a_csv = ",".join(str(i) for i in sorted(audio_ids))
         cmd = [mkvmerge_exe, "-o", str(out_tmp), "-B", "-M", "-a", a_csv]
@@ -1241,30 +1913,49 @@ def _mkv_remux_strip(mkv_path: Path, audio_ids: list[int], sidecar_srt: Path | N
         cmd = [mkvmerge_exe, "-o", str(out_tmp)]
         if sidecar_srt is not None: cmd.extend(["-S", str(mkv_path), "--language", f"0:{MKV_SIDECAR_SRT_LANGUAGE}", str(sidecar_srt)])
         else: cmd.append(str(mkv_path))
+    _log_cmd(cmd)
+    _vv("  running mkvmerge...")
     proc = subprocess.run(cmd, capture_output=True, timeout=3600)
     if proc.returncode != 0:
         out_tmp.unlink(missing_ok=True)
         raise RuntimeError((proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip())
-    target = mkv_path if is_mkv else mkv_path.with_suffix(".mkv")
-    try:
-        mkv_path.rename(bak)
-        try: out_tmp.rename(target); bak.unlink(missing_ok=True)
+    if inplace:
+        target = mkv_path if is_mkv else mkv_path.with_suffix(".mkv")
+        bak = mkv_path.with_name(mkv_path.stem + ".mkvstrip.bak" + mkv_path.suffix)
+        bak.unlink(missing_ok=True)
+        try:
+            mkv_path.rename(bak)
+            try: out_tmp.rename(target); bak.unlink(missing_ok=True)
+            except Exception:
+                if bak.exists() and not target.exists(): bak.rename(mkv_path)
+                out_tmp.unlink(missing_ok=True); raise
         except Exception:
-            if bak.exists() and not target.exists(): bak.rename(mkv_path)
             out_tmp.unlink(missing_ok=True); raise
-    except Exception:
-        out_tmp.unlink(missing_ok=True); raise
+    else:
+        out_tmp.rename(output_path)
 
 def strip_mkvs(root: Path, log_path: Path, *, mkvmerge_dir: str = "") -> None:
+    t0 = _timer_start()
+    _v(f"Step 6 - MKV remux: scanning {root}")
     exe = resolve_mkvmerge_exe(mkvmerge_dir)
     if not exe: _bullet("mkvmerge not found, skipping Step 6."); _mkv_strip_log(log_path, "SKIP: mkvmerge not found"); return
     videos = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in MOVIE_EXTENSIONS and ".mkvstrip.tmp" not in p.name and ".mkvstrip.bak" not in p.name)
+    _v(f"Found {len(videos)} video file(s)")
     if not videos: _bullet("No videos found."); _mkv_strip_log(log_path, "No videos"); return
+    processed_dir = root / "Processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
     ok = skipped = errors = 0
-    for path in videos:
+    for i, path in enumerate(videos):
+        _v(f"[{i+1}/{len(videos)}] Processing: {path.name}")
         try: rel = path.relative_to(root)
         except ValueError: rel = path
         set_window_title(f"Strip MKV: {rel}")
+        # Skip if already processed — output exists in Processed/
+        out_path = (processed_dir / rel).with_suffix(".mkv")
+        if out_path.exists():
+            skipped += 1
+            _mkv_strip_log(log_path, f"SKIP {rel}: already in Processed")
+            continue
         is_mkv = path.suffix.lower() == ".mkv"
         try: info = _mkvmerge_identify(path, exe=exe)
         except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR identify {rel}: {exc}"); continue
@@ -1274,16 +1965,16 @@ def strip_mkvs(root: Path, log_path: Path, *, mkvmerge_dir: str = "") -> None:
         if not is_mkv:
             if sidecar is None: skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: no sidecar .srt"); continue
             if _has_romanian_subtitle(path): skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: already has RO"); continue
-            try: _mkv_remux_strip(path, [], sidecar, [], mkvmerge_exe=exe); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: remuxed with {sidecar.name}")
+            try: _mkv_remux_strip(path, [], sidecar, [], mkvmerge_exe=exe, output_path=out_path); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: remuxed with {sidecar.name} -> Processed")
             except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR remux {rel}: {exc}")
             continue
         keep_audio, audio_note = _mkv_select_audio_ids(tracks)
         if not keep_audio: skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: {audio_note}"); continue
         ro_sub_ids = _mkv_select_romanian_subtitle_ids(tracks)
         if not _mkv_needs_remux(info, keep_audio, sidecar): skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: already correct ({audio_note})"); continue
-        try: _mkv_remux_strip(path, keep_audio, sidecar, ro_sub_ids, mkvmerge_exe=exe); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: {audio_note}")
+        try: _mkv_remux_strip(path, keep_audio, sidecar, ro_sub_ids, mkvmerge_exe=exe, output_path=out_path); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: {audio_note} -> Processed")
         except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR remux {rel}: {exc}")
-    _bullet(f"MKV: {ok} remuxed, {skipped} skipped, {errors} error(s)")
+    _bullet(f"MKV: {ok} remuxed to Processed/, {skipped} skipped, {errors} error(s)")
 
 # ===========================================================================
 # Dependencies
@@ -1310,12 +2001,24 @@ def _dep_subliminal(subliminal_cli: str = "") -> tuple[bool, str]:
     exe = resolve_subliminal_exe(subliminal_cli)
     return (True, exe) if exe else (False, "not in PATH")
 
+def _dep_convert() -> tuple[bool, str]:
+    for exe_name in ("magick", "convert"):
+        exe = shutil.which(exe_name)
+        if exe:
+            try:
+                v = subprocess.run([exe, "--version"], capture_output=True, timeout=10)
+                line = (v.stdout or v.stderr or b"").decode("utf-8", errors="replace").splitlines()[0] if v.returncode == 0 else exe
+                return True, line.strip()[:80] or exe
+            except (OSError, subprocess.TimeoutExpired): return True, exe
+    return False, "not found (apt install imagemagick)"
+
 def dependency_rows(mkvmerge_dir_cli: str = "", tmm_dir_cli: str = "", subliminal_cli: str = "") -> tuple[list[tuple[str, bool, str]], bool]:
     rows: list[tuple[str, bool, str]] = []
     ok_m, d_m = _dep_mkvmerge(mkvmerge_dir_cli); rows.append(("mkvmerge (required)", ok_m, d_m))
     ok_t, d_t = _dep_tmm(tmm_dir_cli); rows.append(("TMM GUI", ok_t, d_t))
     ok_tc, d_tc = _dep_tmm_cmd(tmm_dir_cli); rows.append(("TMM CLI", ok_tc, d_tc))
     ok_sub, d_sub = _dep_subliminal(subliminal_cli); rows.append(("subliminal", ok_sub, d_sub))
+    ok_cv, d_cv = _dep_convert(); rows.append(("ImageMagick", ok_cv, d_cv))
     return rows, ok_m
 
 def print_dependency_report(mkvmerge_dir_cli: str = "", tmm_dir_cli: str = "", subliminal_cli: str = "") -> tuple[list[tuple[str, bool, str]], bool]:
@@ -1347,67 +2050,164 @@ def try_install_mkvtoolnix() -> tuple[bool, str]:
 # ===========================================================================
 
 def run_pipeline(root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "", skip_rename: bool = False, skip_rename_files: bool = False, skip_clean: bool = False, skip_posters: bool = False, skip_subtitles: bool = False, skip_mkv_strip: bool = False, mkv_strip_log: str = "") -> None:
+    t0 = _timer_start()
+    _v(f"run_pipeline: root={root}")
+    _v(f"  flags: tmdb={'set' if tmdb_api_key else 'no'} omdb={'set' if omdb_api_key else 'no'}")
+    _v(f"  skip: rename={skip_rename} files={skip_rename_files} clean={skip_clean} posters={skip_posters} subs={skip_subtitles} mkv={skip_mkv_strip}")
     _bullet(f"Library: {root}")
-    if organize_loose: set_window_title("Organize loose"); organize_loose_videos_in_root(root, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, auto_fetch_ro_subtitles=organize_auto_fetch_subs, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user)
-    if tmm_run_movies or tmm_run_tvshows:
-        from tmm import run_tmm_cli_sync
-    if not skip_rename: set_window_title("Rename folders"); _heading("Step 1 - Rename folders"); rename_folders(root)
-    if not skip_rename_files: set_window_title("Rename media"); _heading("Step 2 - Rename media"); rename_media_files(root)
-    if not skip_clean: set_window_title("Clean junk"); _heading("Step 3 - Clean junk"); clean_files(root)
-    if not skip_posters: set_window_title("Posters"); _heading("Step 4 - Posters"); convert_posters(root, "")
+    tmm_ran = False
+    # Phase 0: TMM headless — organizes files, creates folders, downloads posters
+    if tmm_run_movies and not skip_rename:
+        tmm_exe = resolve_tmm_cmd_exe(tmm_dir)
+        if tmm_exe:
+            try:
+                _heading("Step 0 - TMM headless (organize + scrape + posters)")
+                _v("Running TMM headless for movies...")
+                run_tmm_cli_sync(tmm_dir, movies=True, tvshows=False)
+                tmm_ran = True
+            except RuntimeError as e: _indent(f"TMM skipped: {e}")
+    if organize_loose:
+        set_window_title("Organize loose"); _v("Step 0 - Organize loose files"); organize_loose_videos_in_root(root, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, auto_fetch_ro_subtitles=organize_auto_fetch_subs, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user)
+    if not skip_rename: set_window_title("Rename folders"); _heading("Step 1 - Rename folders"); _v("Starting rename_folders"); rename_folders(root); _timer_elapsed(t0, "step1")
+    if not skip_rename_files: set_window_title("Rename media"); _heading("Step 2 - Rename media"); _v("Starting rename_media_files"); rename_media_files(root); _timer_elapsed(t0, "step2")
+    if not skip_clean: set_window_title("Clean junk"); _heading("Step 3 - Clean junk"); _v("Starting clean_files"); clean_files(root); _timer_elapsed(t0, "step3")
+    if not skip_posters: set_window_title("Posters"); _heading("Step 4 - Posters"); _v("Starting convert_posters"); convert_posters(root, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key); _timer_elapsed(t0, "step4")
     if fetch_subs:
         set_window_title("Download subs")
         _heading("Step 4b - Download subs")
         langs = [x.strip() for x in subs_lang.replace(",", " ").split() if x.strip()]
+        _v(f"Download subs: lang={langs}")
         fetch_subtitles_subliminal(root, languages=langs, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, force=subs_force)
-    if not skip_subtitles: set_window_title("Fix subtitles"); _heading("Step 5 - Fix subtitles"); fix_subtitles(root)
+    if not skip_subtitles: set_window_title("Fix subtitles"); _heading("Step 5 - Fix subtitles"); _v("Starting fix_subtitles"); fix_subtitles(root); _timer_elapsed(t0, "step5")
     if not skip_mkv_strip:
         set_window_title("MKV remux")
         _heading("Step 6 - MKV remux")
         log_mkv = sanitize_path(mkv_strip_log) if mkv_strip_log else (root / "mkv_strip.log")
+        _v(f"Starting strip_mkvs (log={log_mkv})")
         strip_mkvs(root, log_mkv, mkvmerge_dir=mkvmerge_dir)
+        _timer_elapsed(t0, "step6")
+    _timer_elapsed(t0, "run_pipeline total")
 
 def run_single_step(step: int, root: Path, *, mkv_strip_log: str, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "") -> None:
     if step < 1 or step > 6: return
     run_pipeline(root, mkvmerge_dir=mkvmerge_dir, tmm_dir=tmm_dir, tmm_run_movies=tmm_run_movies and step == 1, tmm_run_tvshows=tmm_run_tvshows and step == 1, organize_loose=organize_loose and step == 1, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, organize_auto_fetch_subs=organize_auto_fetch_subs, fetch_subs=fetch_subs and step in (5, 6), subs_lang=subs_lang, subs_force=subs_force, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, skip_rename=step != 1, skip_rename_files=step != 2, skip_clean=step != 3, skip_posters=step != 4, skip_subtitles=step != 5, skip_mkv_strip=step != 6, mkv_strip_log=mkv_strip_log)
 
+def _status_line(mkvmerge_dir: str, tmm_dir: str, subliminal_exe: str) -> str:
+    parts = []
+    ok_m, d_m = _dep_mkvmerge(mkvmerge_dir)
+    parts.append(f"mkvmerge={'OK' if ok_m else 'NO'}")
+    ok_t, d_t = _dep_tmm(tmm_dir)
+    parts.append(f"TMM={'OK' if ok_t else 'NO'}")
+    ok_s, d_s = _dep_subliminal(subliminal_exe)
+    parts.append(f"subliminal={'OK' if ok_s else 'NO'}")
+    ok_c, d_c = _dep_convert()
+    parts.append(f"convert={'OK' if ok_c else 'NO'}")
+    return " | ".join(parts)
+
+def _menu_tools_submenu(args: argparse.Namespace) -> None:
+    while True:
+        print()
+        _heading("Tools")
+        print("   1) Launch TMM GUI")
+        print("   2) TMM headless — movies")
+        print("   3) TMM headless — TV")
+        print("   4) Set MKVToolNix folder")
+        print("   5) Set TMM folder")
+        print("   0) Back")
+        print("  " + "-" * 50)
+        try: c = input("\n  Choice [0]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): print(); return
+        if c == "0": return
+        elif c == "1":
+            exe = resolve_tmm_exe(args.tmm_dir)
+            if exe:
+                try: subprocess.Popen([str(exe)], cwd=str(exe.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                except OSError as e: _bullet(f"Error: {e}")
+            else: _bullet("TMM not found")
+            input("  Press Enter...")
+        elif c == "2":
+            try: run_tmm_cli_sync(args.tmm_dir, movies=True, tvshows=False)
+            except RuntimeError as e: _bullet(f"ERROR: {e}")
+            input("  Press Enter...")
+        elif c == "3":
+            try: run_tmm_cli_sync(args.tmm_dir, movies=False, tvshows=True)
+            except RuntimeError as e: _bullet(f"ERROR: {e}")
+            input("  Press Enter...")
+        elif c == "4":
+            cur = args.mkvmerge_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_MKVMERGE_DIR", TOOL_DIR_MKVMERGE)
+            raw = input(f"  MKVToolNix dir [{cur}]: ").strip()
+            if raw: args.mkvmerge_dir = raw.strip().strip('"')
+        elif c == "5":
+            cur = args.tmm_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_TMM_DIR", TOOL_DIR_TMM)
+            raw = input(f"  TMM dir [{cur}]: ").strip()
+            if raw: args.tmm_dir = raw.strip().strip('"')
+
+def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
+    while True:
+        print()
+        _heading("Config")
+        print(f"   Root: {root}")
+        print(f"   MKV:  {args.mkvmerge_dir or TOOL_DIR_MKVMERGE or '(auto)'}")
+        print(f"   TMM:  {args.tmm_dir or TOOL_DIR_TMM or '(auto)'}")
+        print(f"   Lang: {args.subs_lang}")
+        print()
+        print("   1) Change root folder")
+        print("   2) Install mkvmerge")
+        print("   3) Check dependencies")
+        print("   0) Back")
+        print("  " + "-" * 50)
+        try: c = input("\n  Choice [0]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): print(); return root
+        if c == "0": return root
+        elif c == "1":
+            raw = input(f"  Folder [{root}]: ").strip()
+            if raw: root = sanitize_path(raw)
+        elif c == "2":
+            if _dep_mkvmerge(args.mkvmerge_dir)[0]: _bullet("mkvmerge already available.")
+            else: ok, msg = try_install_mkvtoolnix(); _bullet(msg)
+            input("  Press Enter...")
+        elif c == "3":
+            print_dependency_report(args.mkvmerge_dir, args.tmm_dir, args.subliminal)
+            input("  Press Enter...")
+
 def interactive_menu(args: argparse.Namespace) -> None:
     set_window_title("Video Organizer")
     root = sanitize_path(args.root)
     mkv_log = args.mkv_strip_log
+    first = True
     while True:
+        if first: first = False
+        else: print()
         _heading("VIDEO ORGANIZER")
-        if not root.is_dir(): _bullet(f"ERROR: {root} is not a directory")
-        else: _bullet(f"Folder: {root}")
-        print_dependency_report(args.mkvmerge_dir, args.tmm_dir, args.subliminal)
+        if not root.is_dir():
+            _bullet(f"ERROR: {root} is not a directory")
+        else:
+            _bullet(f"Folder: {root}")
+            _indent(_status_line(args.mkvmerge_dir, args.tmm_dir, args.subliminal))
+        print()
+        print("   1) Series  — full pipeline (flatten + subs + remux)")
+        print("   2) Movies  — full pipeline (rename + organize + posters + subs + remux)")
+        print("   3) Movies  — single step")
+        print("   4) Movies  — organize loose files")
+        print("   5) Subtitles — download")
+        print("   6) Tools   — TMM, MKVToolNix")
+        print("   7) Config  — folder, deps, paths")
+        print("   8) Movies  — Process to Processed/ (non-destructive)")
+        print("   0) Exit")
         print("  " + "-" * 50)
-        print("  == Series ==")
-        print("   1) Series — full pipeline (flatten + subs + remux)")
-        print("  == Movies ==")
-        print("   2) Movies — full pipeline")
-        print("   3) Movies — single step")
-        print("   4) Movies — organize loose")
-        print("  == Subtitles ==")
-        print("   5) Download subtitles (subliminal)")
-        print("  == Tools ==")
-        print("   6) MKVToolNix folder   7) TMM folder")
-        print("   8) Launch TMM         9) TMM headless movies")
-        print("  10) TMM headless TV")
-        print("  == Setup ==")
-        print("  11) Install mkvmerge")
-        print("  12) Change folder")
-        print("  --------------------------------------------------")
-        c = input("\n  Choice [0]: ").strip() or "0"
+        try: c = input("\n  Choice [0]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): print(); return
         if c == "0": return
         elif c == "1":
             if not root.is_dir(): continue
             mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
             series_pipeline(root, mkvmerge_exe=mkv_exe, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, use_subliminal=args.use_subliminal, subliminal_exe=args.subliminal)
-            input("\n  Press Enter...")
+            input("  Press Enter...")
         elif c == "2":
             if not root.is_dir(): continue
-            run_pipeline(root, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=args.tmm_run_movies, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, skip_rename=False, skip_rename_files=False, skip_clean=False, skip_posters=False, skip_subtitles=False, skip_mkv_strip=False, mkv_strip_log=mkv_log)
-            input("\n  Press Enter...")
+            use_tmm = args.tmm_run_movies or bool(resolve_tmm_cmd_exe(args.tmm_dir))
+            run_pipeline(root, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=use_tmm, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, skip_rename=False, skip_rename_files=False, skip_clean=False, skip_posters=False, skip_subtitles=False, skip_mkv_strip=False, mkv_strip_log=mkv_log)
+            input("  Press Enter...")
         elif c == "3":
             if not root.is_dir(): continue
             print("   1) Rename folders  2) Rename files  3) Clean  4) Posters  5) Fix subs  6) MKV")
@@ -1415,56 +2215,40 @@ def interactive_menu(args: argparse.Namespace) -> None:
             if not s.isdigit() or not (1 <= int(s) <= 6): continue
             st = int(s)
             run_single_step(st, root, mkv_strip_log=mkv_log, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=args.tmm_run_movies, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user)
-            input("\n  Press Enter...")
+            input("  Press Enter...")
         elif c == "4":
             if not root.is_dir(): continue
             organize_loose_videos_in_root(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user)
-            input("\n  Press Enter...")
+            input("  Press Enter...")
         elif c == "5":
+            if not root.is_dir(): continue
             langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
             fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
             input("  Press Enter...")
         elif c == "6":
-            cur = args.mkvmerge_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_MKVMERGE_DIR", TOOL_DIR_MKVMERGE)
-            raw = input(f"  MKVToolNix [{cur}]: ").strip()
-            if raw: args.mkvmerge_dir = raw.strip().strip('"')
+            _menu_tools_submenu(args)
         elif c == "7":
-            cur = args.tmm_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_TMM_DIR", TOOL_DIR_TMM)
-            raw = input(f"  TMM [{cur}]: ").strip()
-            if raw: args.tmm_dir = raw.strip().strip('"')
+            root = _menu_config_submenu(root, args)
         elif c == "8":
-            exe = resolve_tmm_exe(args.tmm_dir)
-            if exe:
-                try: subprocess.Popen([str(exe)], cwd=str(exe.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-                except OSError as e: _bullet(f"Error: {e}")
-            else: _bullet("TMM not found")
+            if not root.is_dir(): continue
+            mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+            organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
             input("  Press Enter...")
-        elif c == "9":
-            try: run_tmm_cli_sync(args.tmm_dir, movies=True, tvshows=False)
-            except RuntimeError as e: _bullet(f"ERROR: {e}")
-            input("  Press Enter...")
-        elif c == "10":
-            try: run_tmm_cli_sync(args.tmm_dir, movies=False, tvshows=True)
-            except RuntimeError as e: _bullet(f"ERROR: {e}")
-            input("  Press Enter...")
-        elif c == "11":
-            if _dep_mkvmerge(args.mkvmerge_dir)[0]: _bullet("mkvmerge already available.")
-            else: ok, msg = try_install_mkvtoolnix(); _bullet(msg)
-            input("  Press Enter...")
-        elif c == "12":
-            raw = input(f"  Folder [{root}]: ").strip()
-            if raw: root = sanitize_path(raw)
 
 # ===========================================================================
 # Series: pipeline
 # ===========================================================================
 
 def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = False, subs_lang: str = "ro", use_subliminal: bool = False, subliminal_exe: str = "", dry_run: bool = False, skip_flatten: bool = False, skip_cleanup: bool = False, skip_dedup: bool = False) -> None:
+    t0 = _timer_start()
+    _v(f"series_pipeline: root={root} fetch_subs={fetch_subs} subs_lang={subs_lang}")
     os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
     os_user = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_USER") or "").strip()
+    _v(f"OS.com API key={'set' if os_api_key else 'NOT SET'}")
     # Flatten first: move videos from subfolders to root
     if not skip_flatten:
         set_window_title("Series: flatten")
+        _v("Flatten phase: moving videos from subfolders to root")
         fl = _flatten_folders(root, dry_run=dry_run)
         if fl: _bullet(f"Flattened: moved {fl} file(s) from subfolders" if not dry_run else f"Would flatten: {fl} file(s) from subfolders")
     # Then collect videos (all at root level after flatten)
@@ -1477,6 +2261,7 @@ def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = 
     videos = [v for v in videos if v.is_file() and not is_own_file(v, root) and not any(m in v.stem.lower() for m in TEMP_MARKS)]
     if not videos: _bullet("No video files found."); return
     _bullet(f"Found {len(videos)} video(s).")
+    _v(f"Collected {len(videos)} videos after filtering")
     if not dry_run and not skip_cleanup:
         cleaned = 0
         for i, video in enumerate(videos):
@@ -1486,7 +2271,8 @@ def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = 
             _cleanup_folder(folder, root); cleaned += 1
         if cleaned: _bullet(f"Cleaned {cleaned} folder(s).")
     downloaded = srt_fixed = srt_errors = video_done = video_errors = video_skipped = 0
-    for video in videos:
+    for i, video in enumerate(videos):
+        _v(f"[{i+1}/{len(videos)}] {video.name}")
         rel = video.relative_to(root)
         set_window_title(f"Series: {rel}")
         _bullet(f"[{rel}]")
@@ -1522,7 +2308,7 @@ def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = 
             if fix_srt_file(srt_path): srt_fixed += 1
             else: srt_errors += 1; continue
             if remux_series_video(video, srt_path, mkvmerge_exe=mkvmerge_exe, lang=subs_lang):
-                video_done += 1; srt_path.unlink(missing_ok=True); _bullet(f"Remuxed {subs_lang.upper()}")
+                video_done += 1; _bullet(f"Remuxed {subs_lang.upper()}")
             else: video_errors += 1
         elif en_id is not None:
             if _remux_keep_sub_track(video, track_id=en_id, mkvmerge_exe=mkvmerge_exe):
@@ -1549,7 +2335,7 @@ def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = 
                     if fix_srt_file(eng_srt): srt_fixed += 1
                     else: srt_errors += 1; continue
                     if remux_series_video(video, eng_srt, mkvmerge_exe=mkvmerge_exe, lang="en"):
-                        video_done += 1; eng_srt.unlink(missing_ok=True); _bullet("Remuxed EN")
+                        video_done += 1; _bullet("Remuxed EN")
                     else: video_errors += 1
                 else: video_skipped += 1
             else: video_skipped += 1
@@ -1616,17 +2402,22 @@ def main() -> None:
     ap.add_argument("--skip-subtitles", action="store_true", help="Skip subtitle fixing")
     ap.add_argument("--skip-mkv-strip", action="store_true", help="Skip MKV remux")
     ap.add_argument("--mkv-strip-log", default="", help="MKV log path")
+    ap.add_argument("--to-processed", action="store_true", help="Non-destructive: copy movies to Processed/")
 
     args = ap.parse_args()
 
     # Path resolution
-    if args.root == "." and not args.no_prompt and args.mode == "menu":
-        try: inp = input(f"Path [{_DEFAULT_ROOT}]: ").strip()
-        except (EOFError, OSError): inp = ""
-        args.root = inp or _DEFAULT_ROOT
+    if args.root == "." and not args.no_prompt and not args.check_deps and not args.install_deps:
+        if args.mode == "menu" and not args.interactive:
+            try: inp = input(f"Path [{_DEFAULT_ROOT}]: ").strip()
+            except (EOFError, OSError): inp = ""
+            args.root = inp or _DEFAULT_ROOT
+        else:
+            args.root = _DEFAULT_ROOT or "."
     root = sanitize_path(args.root)
     if root.is_file(): root = root.parent
-    if not root.is_dir(): print(f"ERROR: '{root}' is not a directory."); sys.exit(1)
+    if not root.is_dir() and not args.check_deps and not args.install_deps:
+        print(f"ERROR: '{root}' is not a directory."); sys.exit(1)
 
     # Dispatch
     if args.check_deps:
@@ -1636,29 +2427,23 @@ def main() -> None:
         if _dep_mkvmerge(args.mkvmerge_dir)[0]: _bullet("mkvmerge already available.")
         else: ok, msg = try_install_mkvtoolnix(); _bullet(msg)
         sys.exit(0)
+    if args.to_processed:
+        mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+        organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
+        return
     if args.interactive or args.mode == "movies":
-        interactive_menu(args); return
+        try: interactive_menu(args)
+        except KeyboardInterrupt: print("\n  Bye!"); return
+        return
     if args.mode == "series":
         mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
         series_pipeline(root, mkvmerge_exe=mkv_exe, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, use_subliminal=args.use_subliminal, subliminal_exe=args.subliminal, dry_run=args.dry_run, skip_flatten=args.skip_flatten, skip_cleanup=args.skip_cleanup, skip_dedup=args.skip_dedup)
         return
 
     # Interactive menu (default)
-    _heading("Video Organizer")
-    _bullet(f"Root: {root}")
-    print()
-    print("  1) Series pipeline - fetch subs, fix encoding, remux, cleanup")
-    print("  2) Movies pipeline - organize, posters, subs, remux (interactive menu)")
-    print("  0) Exit")
-    try: choice = input("\n  Choice [1]: ").strip() or "1"
-    except (EOFError, OSError): choice = "1"
-    if choice == "1":
-        mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
-        series_pipeline(root, mkvmerge_exe=mkv_exe, fetch_subs=True, subs_lang="ro", use_subliminal=False, subliminal_exe="", dry_run=False, skip_cleanup=False, skip_dedup=False)
-    elif choice == "2":
-        # Set up args for interactive_menu
-        if args.root == ".": args.root = str(root)
-        interactive_menu(args)
+    try: interactive_menu(args)
+    except KeyboardInterrupt: print("\n  Bye!")
 
 if __name__ == "__main__":
-    main()
+    try: main()
+    except KeyboardInterrupt: print("\n  Bye!")

@@ -1,8 +1,8 @@
 {
   "_comment": "Copy this file to config.json and fill in your values. config.json is gitignored.",
   "api_keys": {
-    "tmdb": "",
-    "omdb": "",
+    "tmdb": "YOUR_TMDB_API_KEY",
+    "omdb": "YOUR_OMDB_API_KEY",
     "opensubtitles_com_api_key": "",
     "opensubtitles_com_user": "",
     "opensubtitles_com_password": "",
@@ -14,6 +14,6 @@
     "tmm_dir": "/opt/tinyMediaManager"
   },
   "defaults": {
-    "root_dir": "/mnt/data/media"
+    "root_dir": "C:\\Users\\Ursu\\Desktop\\2W"
   }
 }
