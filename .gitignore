@@ -1,15 +1,28 @@
 # Config with credentials — copy config.example.json → config.json
 config.json
 
+# Python artifacts
 __pycache__/
 *.pyc
 *.pyo
 *.py[cod]
 *$py.class
+
+# Agent/IDE config
+.claude/
+.claude-flow/
+
+# Virtual envs
 .env
 venv/
 .venv/
+
+# Output
 output/
 *.mp4
 *.mp3
 *.log
+
+# Temp debug files
+DEBUG_*.md
+ROMANIAN_*.md
