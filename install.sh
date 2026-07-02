@@ -3,7 +3,7 @@ set -euo pipefail
 
 echo "==> Installing required packages..."
 sudo apt-get update -qq
-sudo apt-get install -y mkvtoolnix ffmpeg python3 imagemagick
+sudo apt-get install -y mkvtoolnix ffmpeg python3 imagemagick unrar
 
 echo "==> Installing subtitle downloader..."
 if command -v pip3 &>/dev/null; then
