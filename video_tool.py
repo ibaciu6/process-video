@@ -77,6 +77,16 @@ OWN_EXTENSIONS = {".py", ".sh"}
 # Encoding detection
 CODEPAGE_CANDIDATES = ["cp1250", "iso8859-2", "iso8859-16", "cp852", "cp1252"]
 
+# Romanian diacritic → plain Latin mapping (TV-safe)
+DIACRITICS_MAP = {
+    ord('\u0103'): 'a', ord('\u00E2'): 'a', ord('\u00EE'): 'i',
+    ord('\u0219'): 's', ord('\u021B'): 't',
+    ord('\u0102'): 'A', ord('\u00C2'): 'A', ord('\u00CE'): 'I',
+    ord('\u0218'): 'S', ord('\u021A'): 'T',
+    ord('\u015F'): 's', ord('\u0163'): 't',
+    ord('\u015E'): 'S', ord('\u0162'): 'T',
+}
+
 # Regex patterns - movies
 RE_MOVIE_FOLDER = re.compile(r"^(.*) \((\d{4})\)$")
 RE_YEAR_NAME_FOLDER = re.compile(r"^(\d{4}) - (.+)$")
@@ -801,6 +811,67 @@ def fix_srt_file(srt_path: Path) -> bool:
         if bak.exists(): bak.rename(srt_path)
         _vv("  rename error")
         return False
+
+def strip_srt_diacritics(srt_path: Path) -> bool:
+    _v(f"Strip diacritics: {srt_path.name}")
+    try:
+        raw = srt_path.read_bytes()
+        text = raw.decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        _vv("  read error")
+        return False
+    before = sum(1 for c in text if ord(c) in DIACRITICS_MAP)
+    if not before:
+        _vv("  no diacritics found")
+        return True
+    cleaned = text.translate(DIACRITICS_MAP)
+    tmp = srt_path.with_name(srt_path.stem + ".tmpdiac" + srt_path.suffix)
+    if tmp.exists():
+        tmp = srt_path.with_name(srt_path.stem + ".tmpdiac." + uuid.uuid4().hex + srt_path.suffix)
+    try:
+        tmp.write_bytes(codecs.BOM_UTF8 + cleaned.encode("utf-8"))
+    except OSError:
+        _vv("  write error")
+        return False
+    bak = srt_path.with_name(srt_path.stem + ".bak" + srt_path.suffix)
+    bak.unlink(missing_ok=True)
+    try:
+        srt_path.rename(bak)
+    except OSError:
+        tmp.unlink()
+        return False
+    try:
+        tmp.rename(srt_path)
+        bak.unlink()
+        _vv(f"  removed {before} diacritics, OK")
+        return True
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        if bak.exists():
+            bak.rename(srt_path)
+        _vv("  rename error")
+        return False
+
+def _find_video_srt_pairs(root: Path) -> list[tuple[Path, Path]]:
+    pairs: list[tuple[Path, Path]] = []
+    for ext in VIDEO_EXTENSIONS:
+        for vp in root.rglob(f"*{ext}"):
+            if not vp.is_file():
+                continue
+            if any(m in vp.stem.lower() for m in (".keep", ".remux", ".dedup", ".bak")):
+                continue
+            srtp = vp.with_suffix(".srt")
+            if srtp.is_file():
+                pairs.append((vp, srtp))
+        for vp in root.rglob(f"*{ext.upper()}"):
+            if not vp.is_file():
+                continue
+            if any(m in vp.stem.lower() for m in (".keep", ".remux", ".dedup", ".bak")):
+                continue
+            srtp = vp.with_suffix(".srt")
+            if srtp.is_file():
+                pairs.append((vp, srtp))
+    return sorted(set(pairs))
 
 # ===========================================================================
 # Cleanup
@@ -2104,6 +2175,89 @@ def _status_line(mkvmerge_dir: str, tmm_dir: str, subliminal_exe: str) -> str:
     parts.append(f"convert={'OK' if ok_c else 'NO'}")
     return " | ".join(parts)
 
+def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
+    while True:
+        print()
+        _heading("Subtitles")
+        print(f"   Folder: {root}")
+        print()
+        print("   1) Download subtitles (subliminal)")
+        print("   2) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)")
+        print("   3) Strip Romanian diacritics (ăâîșț → aai st)")
+        print("   4) Remux: strip embedded subs + mux sidecar SRT")
+        print("   5) Full pipeline: fix → strip diacritics → remux")
+        print("   0) Back")
+        print("  " + "-" * 50)
+        try: c = input("\n  Choice [0]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): print(); return
+        if c == "0": return
+        if not root.is_dir():
+            _bullet(f"ERROR: {root} not a directory"); input("  Press Enter..."); continue
+        mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+
+        if c == "1":
+            langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
+            fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
+            input("  Press Enter...")
+
+        elif c == "2":
+            pairs = _find_video_srt_pairs(root)
+            if not pairs:
+                _bullet("No SRT files found alongside videos.")
+            else:
+                ok = fail = 0
+                for vp, srtp in pairs:
+                    if fix_srt_file(srtp): ok += 1
+                    else: fail += 1
+                _bullet(f"Fixed {ok} SRT(s)" + (f", {fail} failed" if fail else ""))
+            input("  Press Enter...")
+
+        elif c == "3":
+            pairs = _find_video_srt_pairs(root)
+            if not pairs:
+                _bullet("No SRT files found alongside videos.")
+            else:
+                ok = skip = fail = 0
+                for vp, srtp in pairs:
+                    if strip_srt_diacritics(srtp): ok += 1
+                    else: fail += 1
+                _bullet(f"Stripped diacritics from {ok} SRT(s)" + (f", {fail} failed" if fail else ""))
+            input("  Press Enter...")
+
+        elif c == "4":
+            pairs = _find_video_srt_pairs(root)
+            if not pairs:
+                _bullet("No video+SRT pairs found.")
+            elif not mkv_exe:
+                _bullet("mkvmerge not found — can't remux.")
+            else:
+                ok = fail = 0
+                for vp, srtp in pairs:
+                    if remux_series_video(vp, srtp, mkvmerge_exe=mkv_exe, lang=args.subs_lang):
+                        ok += 1; _bullet(f"  Remuxed: {vp.parent.name}/{vp.name}")
+                    else: fail += 1
+                _bullet(f"Remuxed {ok} file(s)" + (f", {fail} failed" if fail else ""))
+            input("  Press Enter...")
+
+        elif c == "5":
+            pairs = _find_video_srt_pairs(root)
+            if not pairs:
+                _bullet("No video+SRT pairs found.")
+            elif not mkv_exe:
+                _bullet("mkvmerge not found — can't remux.")
+            else:
+                ok = fail = 0
+                for vp, srtp in pairs:
+                    ok_here = 0
+                    if fix_srt_file(srtp): ok_here += 1
+                    if strip_srt_diacritics(srtp): ok_here += 1
+                    if remux_series_video(vp, srtp, mkvmerge_exe=mkv_exe, lang=args.subs_lang):
+                        ok_here += 1
+                    if ok_here == 3: ok += 1
+                    else: fail += 1
+                _bullet(f"Pipeline: {ok} OK, {fail} failed")
+            input("  Press Enter...")
+
 def _menu_tools_submenu(args: argparse.Namespace) -> None:
     while True:
         print()
@@ -2189,7 +2343,7 @@ def interactive_menu(args: argparse.Namespace) -> None:
         print("   2) Movies  — full pipeline (rename + organize + posters + subs + remux)")
         print("   3) Movies  — single step")
         print("   4) Movies  — organize loose files")
-        print("   5) Subtitles — download")
+        print("   5) Subtitles — fix, strip diacritics, remux")
         print("   6) Tools   — TMM, MKVToolNix")
         print("   7) Config  — folder, deps, paths")
         print("   8) Movies  — Process to Processed/ (non-destructive)")
@@ -2221,10 +2375,7 @@ def interactive_menu(args: argparse.Namespace) -> None:
             organize_loose_videos_in_root(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user)
             input("  Press Enter...")
         elif c == "5":
-            if not root.is_dir(): continue
-            langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
-            fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
-            input("  Press Enter...")
+            _menu_subtitles_submenu(root, args)
         elif c == "6":
             _menu_tools_submenu(args)
         elif c == "7":
