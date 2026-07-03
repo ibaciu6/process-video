@@ -248,9 +248,12 @@ def _log_cmd(cmd: list[str]) -> None:
 def _timer_start() -> float:
     return datetime.now().timestamp()
 
+def _timer_elapsed_raw(start: float) -> float:
+    return datetime.now().timestamp() - start
+
 def _timer_elapsed(start: float, label: str) -> None:
     if _VERBOSE:
-        elapsed = datetime.now().timestamp() - start
+        elapsed = _timer_elapsed_raw(start)
         _vv(f"[TIMING] {label}: {elapsed:.2f}s")
 
 # Ffprobe language for muxed tracks
@@ -2752,15 +2755,190 @@ def run_tmm_cli_sync(tmm_dir_cli: str, *, movies: bool, tvshows: bool, timeout_s
         proc = subprocess.run([str(exe), module, "-u", "-n", "-r"], cwd=cwd, timeout=timeout_sec, text=True)
         if proc.returncode != 0: raise RuntimeError(f"TMM {module} exited with {proc.returncode}")
 
+_ACTION_RESULTS: list[dict] = []
+
+def _action_result(status: str, file: str = "", detail: str = "") -> None:
+    r = {"status": status, "file": file}
+    if detail: r["detail"] = detail
+    _ACTION_RESULTS.append(r)
+
+def _run_action_videos(root: Path, action_fn, *, label: str, api_key: str = "", lang: str = "ro", mkv_exe: str | None = None) -> dict:
+    videos = _find_video_files(root)
+    if not videos:
+        return {"ok": 0, "fail": 0, "skipped": 0, "total": 0}
+    ok = fail = skipped = 0
+    for vp in videos:
+        srtp = vp.with_suffix(".srt")
+        try:
+            if action_fn(vp, srtp, api_key=api_key, lang=lang, mkv_exe=mkv_exe):
+                ok += 1
+                _action_result("ok", file=str(vp))
+            else:
+                fail += 1
+                _action_result("fail", file=str(vp))
+        except Exception as e:
+            fail += 1
+            _action_result("fail", file=str(vp), detail=str(e))
+    return {"ok": ok, "fail": fail, "skipped": skipped, "total": len(videos)}
+
+def _action_subs_hash(root: Path, args: argparse.Namespace) -> dict:
+    os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+    if not os_api_key:
+        return {"error": "No OS.com API key"}
+    def fn(vp, srtp, **kw):
+        if srtp.exists(): return False
+        return opensubtitles_search_and_download_by_hash(vp, srtp, api_key=kw["api_key"], lang=kw["lang"])
+    return _run_action_videos(root, fn, label="subs-hash", api_key=os_api_key, lang=args.subs_lang)
+
+def _action_subs_hash_fallback(root: Path, args: argparse.Namespace) -> dict:
+    os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+    if not os_api_key:
+        return {"error": "No OS.com API key"}
+    def fn(vp, srtp, **kw):
+        if srtp.exists(): return False
+        return download_subtitles_by_hash_with_fallback(vp, srtp, api_key=kw["api_key"], lang=kw["lang"])
+    return _run_action_videos(root, fn, label="subs-hash-fallback", api_key=os_api_key, lang=args.subs_lang)
+
+def _action_subs_download(root: Path, args: argparse.Namespace) -> dict:
+    langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
+    fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
+    return {}
+
+def _action_subs_fix(root: Path, args: argparse.Namespace) -> dict:
+    pairs = _find_video_srt_pairs(root)
+    ok = fail = 0
+    for _, srtp in pairs:
+        if fix_srt_file(srtp):
+            ok += 1
+            _action_result("ok", file=str(srtp))
+        else:
+            fail += 1
+            _action_result("fail", file=str(srtp))
+    return {"ok": ok, "fail": fail, "total": len(pairs)}
+
+def _action_subs_strip(root: Path, args: argparse.Namespace) -> dict:
+    pairs = _find_video_srt_pairs(root)
+    ok = fail = 0
+    for _, srtp in pairs:
+        if strip_srt_diacritics(srtp):
+            ok += 1
+            _action_result("ok", file=str(srtp))
+        else:
+            fail += 1
+            _action_result("fail", file=str(srtp))
+    return {"ok": ok, "fail": fail, "total": len(pairs)}
+
+def _action_subs_remux(root: Path, args: argparse.Namespace) -> dict:
+    mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+    if not mkv_exe:
+        return {"error": "mkvmerge not found"}
+    pairs = _find_video_srt_pairs(root)
+    ok = fail = 0
+    for vp, srtp in pairs:
+        if remux_series_video(vp, srtp, mkvmerge_exe=mkv_exe, lang=args.subs_lang):
+            ok += 1
+            _action_result("ok", file=str(vp))
+        else:
+            fail += 1
+            _action_result("fail", file=str(vp))
+    return {"ok": ok, "fail": fail, "total": len(pairs)}
+
+def _action_subs_pipeline(root: Path, args: argparse.Namespace) -> dict:
+    os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+    mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+    if not mkv_exe:
+        return {"error": "mkvmerge not found"}
+    videos = _find_video_files(root)
+    ok = fail = 0
+    for vp in videos:
+        srtp = vp.with_suffix(".srt")
+        if not srtp.exists():
+            if os_api_key:
+                download_subtitles_by_hash_with_fallback(vp, srtp, api_key=os_api_key, lang=args.subs_lang)
+        if not srtp.exists():
+            _action_result("skip", file=str(vp), detail="no SRT")
+            continue
+        ok_here = 0
+        if fix_srt_file(srtp): ok_here += 1
+        if strip_srt_diacritics(srtp): ok_here += 1
+        if remux_series_video(vp, srtp, mkvmerge_exe=mkv_exe, lang=args.subs_lang): ok_here += 1
+        if ok_here == 3:
+            ok += 1
+            _action_result("ok", file=str(vp))
+        else:
+            fail += 1
+            _action_result("fail", file=str(vp), detail=f"{ok_here}/3 steps ok")
+    return {"ok": ok, "fail": fail, "total": len(videos)}
+
+# Action dispatch table
+_ACTIONS: dict[str, tuple[str, callable]] = {
+    "subs-hash": ("Hash search via OS.com", _action_subs_hash),
+    "subs-hash-fallback": ("Hash search + name fallback", _action_subs_hash_fallback),
+    "subs-download": ("Download subs via subliminal", _action_subs_download),
+    "subs-fix": ("Fix SRT encoding", _action_subs_fix),
+    "subs-strip": ("Strip diacritics", _action_subs_strip),
+    "subs-remux": ("Remux sidecar SRT", _action_subs_remux),
+    "subs-pipeline": ("Full pipeline: hash → fix → strip → remux", _action_subs_pipeline),
+}
+
 # ===========================================================================
 # Main — unified entry point
 # ===========================================================================
 
+def _run_action(root: Path, args: argparse.Namespace) -> dict | None:
+    """Dispatch to action handler and return JSON-serializable result."""
+    action = args.action
+    if action not in _ACTIONS:
+        return None
+    name, fn = _ACTIONS[action]
+    _heading(name)
+    t0 = _timer_start()
+    result = fn(root, args)
+    result["action"] = action
+    result["elapsed"] = round(_timer_elapsed_raw(t0), 2)
+    result["results"] = _ACTION_RESULTS
+    # Print JSON summary to stdout after all human output
+    if args.json:
+        print("\n" + json.dumps(result, ensure_ascii=False))
+    else:
+        _bullet(f"Done. {result.get('ok', 0)} ok, {result.get('fail', 0)} fail"
+                   f"{', ' + str(result.get('skipped', 0)) + ' skipped' if result.get('skipped') else ''}")
+    return result
+
+def _exit_code(result: dict) -> int:
+    if result.get("error"):
+        return 3
+    fail = result.get("fail", 0)
+    ok = result.get("ok", 0)
+    if fail and not ok:
+        return 2
+    if fail:
+        return 1
+    return 0
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Video organizer: Movies & Series pipeline.")
+    ap = argparse.ArgumentParser(description="Video organizer: Movies & Series pipeline.", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Actions (--action):
+  subs-hash           Hash search via OS.com (exact match)
+  subs-hash-fallback  Hash search + name fallback
+  subs-download       Download subs via subliminal
+  subs-fix            Fix SRT encoding (cp1250/iso-8859-2 → UTF-8)
+  subs-strip          Strip Romanian diacritics
+  subs-remux          Remux sidecar SRT into video
+  subs-pipeline       Full pipeline: hash → fix → strip → remux
+  series              Full series pipeline
+  movies              Full movies pipeline
+
+Examples:
+  %% python3 video_tool.py --root /path --action subs-pipeline --json
+  %% python3 video_tool.py --root /path --action subs-hash --json
+  %% python3 video_tool.py --root /path --action subs-pipeline
+""")
     ap.add_argument("--root", default=".", help="Root path (default: current dir; resolves '.' and '..')")
     ap.add_argument("--no-prompt", action="store_true", help="Skip path prompt, use default root")
     ap.add_argument("--mode", choices=["movies", "series", "menu"], default="menu", help="Run mode (default: interactive menu)")
+    ap.add_argument("--action", default="", choices=list(_ACTIONS.keys()), help="Non-interactive action for AI/scripting use")
+    ap.add_argument("--json", action="store_true", help="JSON output (machine-readable)")
 
     # Series flags
     ap.add_argument("--fetch-subs", action="store_true", help="Download missing subtitles")
@@ -2771,7 +2949,6 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Preview only")
     ap.add_argument("--skip-flatten", action="store_true", help="Skip moving video files from subfolders to root")
     ap.add_argument("--skip-cleanup", action="store_true", help="Skip junk deletion and file renaming")
-
 
     # Movies flags
     ap.add_argument("-i", "--interactive", "--menu", action="store_true", help="Interactive menu")
@@ -2809,6 +2986,14 @@ def main() -> None:
     if root.is_file(): root = root.parent
     if not root.is_dir() and not args.check_deps and not args.install_deps:
         print(f"ERROR: '{root}' is not a directory."); sys.exit(1)
+
+    # Action dispatch (AI/scripting mode)
+    if args.action:
+        result = _run_action(root, args)
+        if result is None:
+            print(f"ERROR: unknown action '{args.action}'")
+            sys.exit(3)
+        sys.exit(_exit_code(result))
 
     # Dispatch
     if args.check_deps:
