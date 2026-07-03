@@ -985,6 +985,40 @@ def parse_episode_stem(stem: str) -> tuple[str, int, int, str] | None:
 def _os_headers(api_key: str) -> dict[str, str]:
     return {"User-Agent": OPENSUBTITLES_COM_USER_AGENT, "Api-Key": api_key.strip(), "Accept": "application/json"}
 
+def _compute_opensubtitles_hash(path: Path) -> tuple[str, int] | None:
+    """OpenSubtitles hash: 64-bit from first/last 64KB + file size.
+
+    Returns (hex_hash, file_size_in_bytes) or None on error.
+    """
+    chunk_size = 65536
+    try:
+        size = path.stat().st_size
+        if size < chunk_size * 2:
+            return None
+        with path.open("rb") as f:
+            head = f.read(chunk_size)
+            f.seek(-chunk_size, os.SEEK_END)
+            tail = f.read(chunk_size)
+    except OSError:
+        return None
+    data = head + tail
+    lo = size & 0xFFFFFFFF
+    hi = (size >> 32) & 0xFFFFFFFF
+    max32 = 0x100000000
+    for i in range(0, len(data), 8):
+        chunk = data[i:i+8]
+        if len(chunk) < 8:
+            chunk = chunk + b"\x00" * (8 - len(chunk))
+        a, b, c, d, e, f, g, h = chunk
+        lo = (lo + a + (b << 8) + (c << 16) + (d << 24))
+        hi = (hi + e + (f << 8) + (g << 16) + (h << 24))
+        if lo >= max32:
+            hi += lo >> 32
+            lo &= 0xFFFFFFFF
+        if hi >= max32:
+            hi &= 0xFFFFFFFF
+    return f"{hi:08x}{lo:08x}", size
+
 def opensubtitles_download(query: str, dest: Path, *, api_key: str, lang: str = "ro", season: int | None = None, episode: int | None = None) -> bool:
     key = (api_key or "").strip()
     if not key: return False
@@ -1019,6 +1053,102 @@ def opensubtitles_download(query: str, dest: Path, *, api_key: str, lang: str = 
     if len(blob) < 50: return False
     try: dest.write_bytes(blob); return True
     except OSError: return False
+
+def _os_download_file_id(file_id: int, dest: Path, *, api_key: str) -> bool:
+    key = (api_key or "").strip()
+    if not key:
+        return False
+    try:
+        dreq = urllib.request.Request(
+            f"{OPENSUBTITLES_COM_API_BASE}/download",
+            data=json.dumps({"file_id": file_id}).encode("utf-8"),
+            method="POST",
+            headers={**_os_headers(key), "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(dreq, timeout=45) as resp:
+            dresp = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return False
+    link = dresp.get("link")
+    if not link or not isinstance(link, str):
+        return False
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(link, headers={"User-Agent": OPENSUBTITLES_COM_USER_AGENT}),
+            timeout=120,
+        ) as resp:
+            blob = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        return False
+    if len(blob) < 50:
+        return False
+    try:
+        dest.write_bytes(blob)
+        return True
+    except OSError:
+        return False
+
+def opensubtitles_search_and_download_by_hash(video_path: Path, dest: Path, *, api_key: str, lang: str = "ro") -> bool:
+    """Hash-based subtitle search via OpenSubtitles.com REST API.
+
+    Computes file hash, queries OS.com for exact-match subtitle,
+    downloads best match (preferring Romanian, non-HI, trusted).
+    Returns True on success.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        _vv("  no API key")
+        return False
+    h = _compute_opensubtitles_hash(video_path)
+    if h is None:
+        _vv("  hash computation failed (file too small?)")
+        return False
+    movie_hash, file_size = h
+    _vv(f"  OS hash={movie_hash} size={file_size}")
+    params = urllib.parse.urlencode({
+        "moviehash": movie_hash,
+        "moviebytesize": str(file_size),
+        "languages": lang,
+    })
+    url = f"{OPENSUBTITLES_COM_API_BASE}/subtitles?{params}"
+    try:
+        req = urllib.request.Request(url, headers=_os_headers(key))
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        _vv(f"  search error: {e}")
+        return False
+    items = data.get("data") or []
+    if not items:
+        _vv("  no subtitle found by hash")
+        return False
+    _vv(f"  found {len(items)} subtitle(s) by hash")
+    scored: list[tuple[int, int]] = []
+    for item in items:
+        attr = item.get("attributes") or {}
+        files = attr.get("files") or []
+        if not files or files[0].get("file_id") is None:
+            continue
+        fid = int(files[0]["file_id"])
+        score = 0
+        sub_lang = (attr.get("language") or "").lower()
+        if sub_lang in ("ro", "rum", "ron"):
+            score += 100
+        if attr.get("trusted"):
+            score += 50
+        if attr.get("hd"):
+            score += 20
+        if attr.get("hearing_impaired"):
+            score -= 30
+        scored.append((score, fid))
+    if not scored:
+        _vv("  no downloadable files")
+        return False
+    scored.sort(key=lambda x: -x[0])
+    best_fid = scored[0][1]
+    _vv(f"  best file_id={best_fid} (score={scored[0][0]})")
+    return _os_download_file_id(best_fid, dest, api_key=key)
+
 def _download_from_romanian_subtitles(query: str, dest: Path, *, lang: str = "romanian") -> bool:
     return _download_from_romanian_subtitles_better(query, dest, lang=lang)
 
@@ -2181,11 +2311,12 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
         _heading("Subtitles")
         print(f"   Folder: {root}")
         print()
-        print("   1) Download subtitles (subliminal)")
-        print("   2) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)")
-        print("   3) Strip Romanian diacritics (ăâîșț → aai st)")
-        print("   4) Remux: strip embedded subs + mux sidecar SRT")
-        print("   5) Full pipeline: fix → strip diacritics → remux")
+        print("   1) Search by hash & download (OS.com — exact match)")
+        print("   2) Download subtitles (subliminal)")
+        print("   3) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)")
+        print("   4) Strip Romanian diacritics (ăâîșț → aai st)")
+        print("   5) Remux: strip embedded subs + mux sidecar SRT")
+        print("   6) Full pipeline: fix → strip diacritics → remux")
         print("   0) Back")
         print("  " + "-" * 50)
         try: c = input("\n  Choice [0]: ").strip() or "0"
@@ -2196,11 +2327,32 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
         mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
 
         if c == "1":
+            os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+            if not os_api_key:
+                _bullet("No OpenSubtitles.com API key configured.")
+            else:
+                pairs = _find_video_srt_pairs(root)
+                if not pairs:
+                    _bullet("No video files found.")
+                else:
+                    ok = fail = 0
+                    for vp, srtp in pairs:
+                        _v(f"  Hash search: {vp.parent.name}/{vp.name}")
+                        if opensubtitles_search_and_download_by_hash(vp, srtp, api_key=os_api_key, lang=args.subs_lang):
+                            ok += 1
+                            _bullet(f"    Downloaded: {srtp.name}")
+                        else:
+                            fail += 1
+                            _bullet(f"    No match by hash: {vp.name}")
+                    _bullet(f"Searched by hash: {ok} downloaded, {fail} no match")
+            input("  Press Enter...")
+
+        elif c == "2":
             langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
             fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
             input("  Press Enter...")
 
-        elif c == "2":
+        elif c == "3":
             pairs = _find_video_srt_pairs(root)
             if not pairs:
                 _bullet("No SRT files found alongside videos.")
@@ -2212,7 +2364,7 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
                 _bullet(f"Fixed {ok} SRT(s)" + (f", {fail} failed" if fail else ""))
             input("  Press Enter...")
 
-        elif c == "3":
+        elif c == "4":
             pairs = _find_video_srt_pairs(root)
             if not pairs:
                 _bullet("No SRT files found alongside videos.")
@@ -2224,7 +2376,7 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
                 _bullet(f"Stripped diacritics from {ok} SRT(s)" + (f", {fail} failed" if fail else ""))
             input("  Press Enter...")
 
-        elif c == "4":
+        elif c == "5":
             pairs = _find_video_srt_pairs(root)
             if not pairs:
                 _bullet("No video+SRT pairs found.")
@@ -2239,7 +2391,7 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
                 _bullet(f"Remuxed {ok} file(s)" + (f", {fail} failed" if fail else ""))
             input("  Press Enter...")
 
-        elif c == "5":
+        elif c == "6":
             pairs = _find_video_srt_pairs(root)
             if not pairs:
                 _bullet("No video+SRT pairs found.")
