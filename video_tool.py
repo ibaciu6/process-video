@@ -1685,11 +1685,27 @@ def organize_loose_videos_in_root(root: Path, *, tmdb_api_key: str = "", omdb_ap
     filtered = [(vp, mid) for vp, mid in videos_with_tmdb if vp.is_file() and not _has_romanian_subtitle(vp)]
     os_rest_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
     if auto_fetch_ro_subtitles and filtered:
+        # Phase 0: Hash search on source file (same hash after move)
+        if os_rest_key:
+            _heading("Step 0a - Hash-based subtitle search")
+            hash_ok = 0
+            for vp, _ in filtered:
+                srt_path = vp.with_suffix(".srt")
+                if srt_path.exists():
+                    continue
+                if download_subtitles_by_hash_with_fallback(vp, srt_path, api_key=os_rest_key, lang="ro"):
+                    hash_ok += 1
+            if hash_ok:
+                _bullet(f"Hash search: {hash_ok} downloaded")
+        # Subliminal for remaining
+        still_needed = [(vp, mid) for vp, mid in filtered if vp.is_file() and not _has_romanian_subtitle(vp)]
         _heading("Step 0b - Romanian subtitles (Subliminal)")
-        fetch_subtitles_subliminal(root, languages=["ro"], subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, force=False, paths=[v[0] for v in filtered])
-    if auto_fetch_ro_subtitles and filtered and os_rest_key:
-        _heading("Step 0c - OpenSubtitles.com API")
-        opensubtitles_com_try_romanian_for_videos(filtered, consumer_api_key=os_rest_key)
+        fetch_subtitles_subliminal(root, languages=["ro"], subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, force=False, paths=[v[0] for v in still_needed])
+        # OS.com API for remaining
+        still_needed_2 = [(vp, mid) for vp, mid in still_needed if vp.is_file() and not _has_romanian_subtitle(vp)]
+        if still_needed_2 and os_rest_key:
+            _heading("Step 0c - OpenSubtitles.com API")
+            opensubtitles_com_try_romanian_for_videos(still_needed_2, consumer_api_key=os_rest_key)
 
 def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_key: str = "", auto_fetch_ro_subtitles: bool = True, subliminal_exe: str = "", opensubtitlescom_user: str = "", mkvmerge_exe: str | None = None) -> None:
     """Copy movies to Processed/<year> - <title>/ without touching originals.
