@@ -14,6 +14,6 @@
     "tmm_dir": "/opt/tinyMediaManager"
   },
   "defaults": {
-    "root_dir": "C:\\Users\\Ursu\\Desktop\\2W"
+    "root_dir": "/path/to/your/videos"
   }
 }
