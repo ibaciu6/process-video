@@ -2282,7 +2282,10 @@ def try_install_mkvtoolnix() -> tuple[bool, str]:
     if shutil.which("pacman"):
         r = run_cmd(["sudo", "pacman", "-S", "--noconfirm", "mkvtoolnix"], timeout=900)
         return (True, "pacman OK") if r.returncode == 0 else (False, "pacman failed")
-    return False, "unsupported package manager"
+    if shutil.which("brew"):
+        r = run_cmd(["brew", "install", "mkvtoolnix"], timeout=900)
+        return (True, "brew OK") if r.returncode == 0 else (False, "brew failed")
+    return False, "unsupported package manager (supported: apt/dnf/pacman/brew)"
 
 # ===========================================================================
 # Movies: run_pipeline + run_single_step + interactive_menu
@@ -2496,11 +2499,21 @@ def _menu_tools_submenu(args: argparse.Namespace) -> None:
         elif c == "4":
             cur = args.mkvmerge_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_MKVMERGE_DIR", TOOL_DIR_MKVMERGE)
             raw = input(f"  MKVToolNix dir [{cur}]: ").strip()
-            if raw: args.mkvmerge_dir = raw.strip().strip('"')
+            if raw:
+                val = raw.strip().strip('"')
+                args.mkvmerge_dir = val
+                _CFG.setdefault("tools", {})["mkvmerge_dir"] = val
+                _save_config()
+                _bullet("  MKVToolNix dir saved to config.json")
         elif c == "5":
             cur = args.tmm_dir or _coalesce_tool_dir("", "PROCESS_MOVIES_TMM_DIR", TOOL_DIR_TMM)
             raw = input(f"  TMM dir [{cur}]: ").strip()
-            if raw: args.tmm_dir = raw.strip().strip('"')
+            if raw:
+                val = raw.strip().strip('"')
+                args.tmm_dir = val
+                _CFG.setdefault("tools", {})["tmm_dir"] = val
+                _save_config()
+                _bullet("  TMM dir saved to config.json")
 
 def _menu_api_keys_submenu() -> None:
     keys = [
@@ -2548,7 +2561,11 @@ def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
         if c == "0": return root
         elif c == "1":
             raw = input(f"  Folder [{root}]: ").strip()
-            if raw: root = sanitize_path(raw)
+            if raw:
+                root = sanitize_path(raw)
+                _CFG.setdefault("defaults", {})["root_dir"] = str(root)
+                _save_config()
+                _bullet("  Root folder saved to config.json")
         elif c == "2":
             if _dep_mkvmerge(args.mkvmerge_dir)[0]: _bullet("mkvmerge already available.")
             else: ok, msg = try_install_mkvtoolnix(); _bullet(msg)
