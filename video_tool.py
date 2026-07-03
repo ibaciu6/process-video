@@ -923,7 +923,6 @@ def _flatten_folders(root: Path, dry_run: bool = False) -> int:
         else:
             shutil.rmtree(child, ignore_errors=True)
     return moved
-    return moved
 
 # ===========================================================================
 # Series-specific: episode parsing + OpenSubtitles download + remux
@@ -1477,9 +1476,6 @@ def cinemeta_lookup_canonical_title(rough_title: str, year: str) -> str | None:
         if isinstance(name, str) and name.strip(): return clean_title_for_fs(name.strip()) or None
     return None
 
-def _opensubtitles_com_headers(os_api_key: str) -> dict[str, str]:
-    return _os_headers(os_api_key)
-
 def opensubtitles_com_download_romanian_srt(consumer_api_key: str, tmdb_movie_id: int, dest_srt: Path) -> bool:
     """Download Romanian subtitle from OpenSubTitles.com API.
 
@@ -1493,7 +1489,7 @@ def opensubtitles_com_download_romanian_srt(consumer_api_key: str, tmdb_movie_id
     q = urllib.parse.urlencode({"languages": "ro", "tmdb_id": str(tmdb_movie_id), "order_by": "download_count", "order_direction": "desc"})
     _vv(f"  searching OS.com for tmdb_id={tmdb_movie_id}...")
     try:
-        req = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/subtitles?{q}", headers=_opensubtitles_com_headers(consumer_api_key))
+        req = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/subtitles?{q}", headers=_os_headers(consumer_api_key))
         with urllib.request.urlopen(req, timeout=45) as resp: data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
         _vv(f"  search error: {e}")
@@ -1509,7 +1505,7 @@ def opensubtitles_com_download_romanian_srt(consumer_api_key: str, tmdb_movie_id
         return False
     _vv(f"  file_id={file_id}")
     try:
-        dreq = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/download", data=json.dumps({"file_id": file_id}).encode("utf-8"), method="POST", headers={**_opensubtitles_com_headers(consumer_api_key), "Content-Type": "application/json"})
+        dreq = urllib.request.Request(f"{OPENSUBTITLES_COM_API_BASE}/download", data=json.dumps({"file_id": file_id}).encode("utf-8"), method="POST", headers={**_os_headers(consumer_api_key), "Content-Type": "application/json"})
         with urllib.request.urlopen(dreq, timeout=45) as resp: dresp = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError): return False
     link = dresp.get("link")
@@ -2240,6 +2236,16 @@ def _dep_subliminal(subliminal_cli: str = "") -> tuple[bool, str]:
     exe = resolve_subliminal_exe(subliminal_cli)
     return (True, exe) if exe else (False, "not in PATH")
 
+def _dep_ffprobe() -> tuple[bool, str]:
+    exe = shutil.which("ffprobe")
+    if exe:
+        try:
+            v = subprocess.run([exe, "-version"], capture_output=True, timeout=10)
+            line = (v.stdout or v.stderr or b"").decode("utf-8", errors="replace").splitlines()[0] if v.returncode == 0 else exe
+            return True, line.strip()[:80] or exe
+        except (OSError, subprocess.TimeoutExpired): return True, exe
+    return False, "not found (apt install ffmpeg)"
+
 def _dep_convert() -> tuple[bool, str]:
     for exe_name in ("magick", "convert"):
         exe = shutil.which(exe_name)
@@ -2254,6 +2260,7 @@ def _dep_convert() -> tuple[bool, str]:
 def dependency_rows(mkvmerge_dir_cli: str = "", tmm_dir_cli: str = "", subliminal_cli: str = "") -> tuple[list[tuple[str, bool, str]], bool]:
     rows: list[tuple[str, bool, str]] = []
     ok_m, d_m = _dep_mkvmerge(mkvmerge_dir_cli); rows.append(("mkvmerge (required)", ok_m, d_m))
+    ok_ff, d_ff = _dep_ffprobe(); rows.append(("ffprobe (required)", ok_ff, d_ff))
     ok_t, d_t = _dep_tmm(tmm_dir_cli); rows.append(("TMM GUI", ok_t, d_t))
     ok_tc, d_tc = _dep_tmm_cmd(tmm_dir_cli); rows.append(("TMM CLI", ok_tc, d_tc))
     ok_sub, d_sub = _dep_subliminal(subliminal_cli); rows.append(("subliminal", ok_sub, d_sub))
@@ -2786,6 +2793,9 @@ def _run_action_videos(root: Path, action_fn, *, label: str, api_key: str = "", 
     ok = fail = skipped = 0
     for vp in videos:
         srtp = vp.with_suffix(".srt")
+        if srtp.exists():
+            skipped += 1
+            continue
         try:
             if action_fn(vp, srtp, api_key=api_key, lang=lang, mkv_exe=mkv_exe):
                 ok += 1
@@ -2803,7 +2813,6 @@ def _action_subs_hash(root: Path, args: argparse.Namespace) -> dict:
     if not os_api_key:
         return {"error": "No OS.com API key"}
     def fn(vp, srtp, **kw):
-        if srtp.exists(): return False
         return opensubtitles_search_and_download_by_hash(vp, srtp, api_key=kw["api_key"], lang=kw["lang"])
     return _run_action_videos(root, fn, label="subs-hash", api_key=os_api_key, lang=args.subs_lang)
 
@@ -2812,14 +2821,13 @@ def _action_subs_hash_fallback(root: Path, args: argparse.Namespace) -> dict:
     if not os_api_key:
         return {"error": "No OS.com API key"}
     def fn(vp, srtp, **kw):
-        if srtp.exists(): return False
         return download_subtitles_by_hash_with_fallback(vp, srtp, api_key=kw["api_key"], lang=kw["lang"])
     return _run_action_videos(root, fn, label="subs-hash-fallback", api_key=os_api_key, lang=args.subs_lang)
 
 def _action_subs_download(root: Path, args: argparse.Namespace) -> dict:
     langs = [x.strip() for x in args.subs_lang.replace(",", " ").split() if x.strip()]
     fetch_subtitles_subliminal(root, languages=langs or ["ro"], subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, force=args.subs_force)
-    return {}
+    return {"ok": 0, "fail": 0, "total": 0}
 
 def _action_subs_fix(root: Path, args: argparse.Namespace) -> dict:
     pairs = _find_video_srt_pairs(root)
