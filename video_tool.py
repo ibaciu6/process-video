@@ -38,6 +38,29 @@ def _load_config() -> dict:
                 pass
     return {}
 
+def _get_config_path() -> Path:
+    p = Path(__file__).parent / "config.json"
+    if p.exists():
+        return p
+    p2 = Path.home() / ".config" / "process-video" / "config.json"
+    if p2.exists():
+        return p2
+    return p
+
+def _save_config() -> None:
+    p = _get_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(_CFG, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+def _set_api_key(key_name: str, display_name: str) -> None:
+    cur = _CFG_KEYS.get(key_name, "")
+    masked = cur[:4] + "****" if len(cur) > 4 else "(empty)"
+    raw = input(f"  {display_name} [{masked}]: ").strip().strip("\"'")
+    if raw:
+        _CFG.setdefault("api_keys", {})[key_name] = raw
+        _save_config()
+        _bullet(f"  {display_name} saved")
+
 _CFG = _load_config()
 _CFG_KEYS  = _CFG.get("api_keys", {})
 _CFG_TOOLS = _CFG.get("tools", {})
@@ -873,6 +896,18 @@ def _find_video_srt_pairs(root: Path) -> list[tuple[Path, Path]]:
                 pairs.append((vp, srtp))
     return sorted(set(pairs))
 
+def _find_video_files(root: Path) -> list[Path]:
+    """Find all video files under root, excluding temp/marks."""
+    videos: list[Path] = []
+    for ext in VIDEO_EXTENSIONS:
+        for vp in root.rglob(f"*{ext}"):
+            if vp.is_file() and not any(m in vp.stem.lower() for m in (".keep", ".remux", ".dedup", ".bak")):
+                videos.append(vp)
+        for vp in root.rglob(f"*{ext.upper()}"):
+            if vp.is_file() and not any(m in vp.stem.lower() for m in (".keep", ".remux", ".dedup", ".bak")):
+                videos.append(vp)
+    return sorted(set(videos))
+
 # ===========================================================================
 # Cleanup
 # ===========================================================================
@@ -1148,6 +1183,47 @@ def opensubtitles_search_and_download_by_hash(video_path: Path, dest: Path, *, a
     best_fid = scored[0][1]
     _vv(f"  best file_id={best_fid} (score={scored[0][0]})")
     return _os_download_file_id(best_fid, dest, api_key=key)
+
+def download_subtitles_by_hash_with_fallback(video_path: Path, dest: Path, *, api_key: str, lang: str = "ro") -> bool:
+    """Try hash-based search first, fall back to name-based OS.com download.
+
+    Uses the source video's original hash (before remuxing) for exact match.
+    If hash finds nothing, falls back to filename-based search.
+    Returns True if a subtitle was downloaded.
+    """
+    h = _compute_opensubtitles_hash(video_path)
+    if h:
+        _v(f"  try hash: {h[0]}")
+        if opensubtitles_search_and_download_by_hash(video_path, dest, api_key=api_key, lang=lang):
+            _bullet(f"  ✓ hash match: {dest.name}")
+            return True
+        _v(f"  hash miss, trying name fallback...")
+    else:
+        _v(f"  hash computation failed, trying name fallback...")
+    # Fallback: name-based search using filename
+    stem = video_path.stem
+    query = stem.replace(".", " ").replace("_", " ").replace("-", " ")
+    # Strip common tags like [1080p], WEBRip, etc.
+    query = re.sub(r"\[.*?\]", "", query)
+    query = re.sub(r"\b\d{3,4}p\b", "", query)
+    query = re.sub(r"\b(WEB[- ]?DL|WEBRip|BluRay|BrRip|x264|x265|HEVC|DD5\.1|DDP5\.1|Atmos|H\.264|YIFY|YTS|GalaxyRG|BONE|MA)\b", "", query, flags=re.I)
+    query = re.sub(r"\s+", " ", query).strip()
+    # Strip leading year
+    query = re.sub(r"^\d{4}\s+", "", query).strip()
+    # Strip trailing year
+    query = re.sub(r"\s+\d{4}$", "", query).strip()
+    if query:
+        _v(f"  name search: '{query}'")
+        if opensubtitles_download(query, dest, api_key=api_key, lang=lang):
+            _bullet(f"  ✓ name match: {dest.name}")
+            return True
+    # Last resort: try original stem as-is
+    _v(f"  name search (raw stem): '{video_path.stem}'")
+    if opensubtitles_download(video_path.stem, dest, api_key=api_key, lang=lang):
+        _bullet(f"  ✓ name match (raw): {dest.name}")
+        return True
+    _bullet(f"  ✗ no subtitles found for {video_path.name}")
+    return False
 
 def _download_from_romanian_subtitles(query: str, dest: Path, *, lang: str = "romanian") -> bool:
     return _download_from_romanian_subtitles_better(query, dest, lang=lang)
@@ -1709,9 +1785,28 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
         _bullet(f"Fetching subtitles for {len(need_subs)} movie(s)...")
         _v(f"Subtitle download phase: {len(need_subs)} need subs")
         pre_subs = subs
+        # Phase 0: Hash search on source copy (same hash as original)
+        _v(f"Phase 0: Hash-based search on video file")
+        for p, _ in need_subs:
+            srt_path = p.with_suffix(".srt")
+            if srt_path.exists():
+                continue
+            if os_api_key and p.is_file():
+                _vv(f"  trying hash for {p.name}")
+                if opensubtitles_search_and_download_by_hash(p, srt_path, api_key=os_api_key, lang="ro"):
+                    subs += 1
+                    _vv(f"  hash download OK")
+                    if fix_srt_file(srt_path):
+                        srt_fixed += 1
+                else:
+                    _vv(f"  hash download failed")
         # Phase 1: OpenSubtitles API for movies with TMDB IDs
-        _v(f"Phase 1: OpenSubtitles.com API via TMDB ID")
-        for p, tm_mid in need_subs:
+        still_needed_1 = [p for p, _ in need_subs if not p.with_suffix(".srt").exists()]
+        _v(f"Phase 1: OpenSubtitles.com API via TMDB ID ({len(still_needed_1)} left)")
+        for p in still_needed_1:
+            tm_mid = None
+            for pp, tmid in need_subs:  # re-find the tmdb id
+                if pp == p: tm_mid = tmid; break
             if tm_mid and os_api_key:
                 srt_path = p.with_suffix(".srt")
                 _vv(f"  trying OS.com for {p.name} (TMDB id={tm_mid})")
@@ -2316,7 +2411,7 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
         print("   3) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)")
         print("   4) Strip Romanian diacritics (ăâîșț → aai st)")
         print("   5) Remux: strip embedded subs + mux sidecar SRT")
-        print("   6) Full pipeline: fix → strip diacritics → remux")
+        print("   6) Full pipeline: hash search → fix → strip diacritics → remux")
         print("   0) Back")
         print("  " + "-" * 50)
         try: c = input("\n  Choice [0]: ").strip() or "0"
@@ -2331,12 +2426,15 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
             if not os_api_key:
                 _bullet("No OpenSubtitles.com API key configured.")
             else:
-                pairs = _find_video_srt_pairs(root)
-                if not pairs:
+                videos = _find_video_files(root)
+                if not videos:
                     _bullet("No video files found.")
                 else:
-                    ok = fail = 0
-                    for vp, srtp in pairs:
+                    ok = fail = skip = 0
+                    for vp in videos:
+                        srtp = vp.with_suffix(".srt")
+                        if srtp.is_file():
+                            skip += 1; continue
                         _v(f"  Hash search: {vp.parent.name}/{vp.name}")
                         if opensubtitles_search_and_download_by_hash(vp, srtp, api_key=os_api_key, lang=args.subs_lang):
                             ok += 1
@@ -2344,7 +2442,7 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
                         else:
                             fail += 1
                             _bullet(f"    No match by hash: {vp.name}")
-                    _bullet(f"Searched by hash: {ok} downloaded, {fail} no match")
+                    _bullet(f"Searched by hash: {ok} downloaded, {fail} no match, {skip} already have SRT")
             input("  Press Enter...")
 
         elif c == "2":
@@ -2392,14 +2490,24 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
             input("  Press Enter...")
 
         elif c == "6":
-            pairs = _find_video_srt_pairs(root)
-            if not pairs:
-                _bullet("No video+SRT pairs found.")
+            os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
+            videos = _find_video_files(root)
+            if not videos:
+                _bullet("No video files found.")
             elif not mkv_exe:
                 _bullet("mkvmerge not found — can't remux.")
             else:
-                ok = fail = 0
-                for vp, srtp in pairs:
+                ok = fail = no_srt = 0
+                for vp in videos:
+                    srtp = vp.with_suffix(".srt")
+                    if not srtp.is_file():
+                        _v(f"  No SRT, trying download: {vp.parent.name}/{vp.name}")
+                        if os_api_key:
+                            download_subtitles_by_hash_with_fallback(vp, srtp, api_key=os_api_key, lang=args.subs_lang)
+                    if not srtp.is_file():
+                        no_srt += 1
+                        _bullet(f"  No SRT, skipping: {vp.parent.name}/{vp.name}")
+                        continue
                     ok_here = 0
                     if fix_srt_file(srtp): ok_here += 1
                     if strip_srt_diacritics(srtp): ok_here += 1
@@ -2407,7 +2515,10 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
                         ok_here += 1
                     if ok_here == 3: ok += 1
                     else: fail += 1
-                _bullet(f"Pipeline: {ok} OK, {fail} failed")
+                parts = [f"Pipeline: {ok} OK"]
+                if fail: parts.append(f"{fail} failed")
+                if no_srt: parts.append(f"{no_srt} skipped (no SRT)")
+                _bullet(", ".join(parts))
             input("  Press Enter...")
 
 def _menu_tools_submenu(args: argparse.Namespace) -> None:
@@ -2448,6 +2559,32 @@ def _menu_tools_submenu(args: argparse.Namespace) -> None:
             raw = input(f"  TMM dir [{cur}]: ").strip()
             if raw: args.tmm_dir = raw.strip().strip('"')
 
+def _menu_api_keys_submenu() -> None:
+    keys = [
+        ("tmdb", "TMDB API key"),
+        ("omdb", "OMDB API key"),
+        ("opensubtitles_com_api_key", "OS.com API key"),
+        ("opensubtitles_com_user", "OS.com username"),
+        ("opensubtitles_com_password", "OS.com password"),
+        ("opensubtitles_org_user", "OS.org username"),
+        ("opensubtitles_org_password", "OS.org password"),
+    ]
+    while True:
+        print()
+        _heading("API Keys")
+        for i, (kn, dn) in enumerate(keys, 1):
+            v = _CFG_KEYS.get(kn, "")
+            disp = v[:4] + "****" if len(v) > 4 else ("(set)" if v else "(empty)")
+            print(f"   {i}) {dn:<26} {disp}")
+        print("   0) Back")
+        print("  " + "-" * 50)
+        try: c = input("\n  Choice [0]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt): print(); return
+        if c == "0": return
+        if c.isdigit() and 1 <= int(c) <= len(keys):
+            kn, dn = keys[int(c) - 1]
+            _set_api_key(kn, dn)
+
 def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
     while True:
         print()
@@ -2460,6 +2597,7 @@ def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
         print("   1) Change root folder")
         print("   2) Install mkvmerge")
         print("   3) Check dependencies")
+        print("   4) API keys — TMDB, OMDB, OpenSubtitles")
         print("   0) Back")
         print("  " + "-" * 50)
         try: c = input("\n  Choice [0]: ").strip() or "0"
@@ -2475,6 +2613,8 @@ def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
         elif c == "3":
             print_dependency_report(args.mkvmerge_dir, args.tmm_dir, args.subliminal)
             input("  Press Enter...")
+        elif c == "4":
+            _menu_api_keys_submenu()
 
 def interactive_menu(args: argparse.Namespace) -> None:
     set_window_title("Video Organizer")
