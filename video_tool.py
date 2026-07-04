@@ -104,6 +104,12 @@ CODEPAGE_CANDIDATES = ["cp1250", "iso8859-2", "iso8859-16", "cp852", "cp1252"]
 RE_MOVIE_FOLDER = re.compile(r"^(.*) \((\d{4})\)$")
 RE_YEAR_NAME_FOLDER = re.compile(r"^(\d{4}) - (.+)$")
 RE_LOOSE_TITLE_YEAR = re.compile(r"^(.+?)\s*\((\d{4})\)")
+RE_SERIES_EPISODE = re.compile(r"S\d{2}E\d{2}", re.IGNORECASE)
+
+def _is_series_path(p: Path) -> bool:
+    """Check if a path belongs to a TV series (contains S01E01 pattern)."""
+    return bool(RE_SERIES_EPISODE.search(p.name)) or any(RE_SERIES_EPISODE.search(part) for part in p.parts)
+
 _RUNON_TRAIL_WORDS = frozenset({
     "again", "back", "bites", "boys", "brother", "city", "club", "daughter",
     "day", "days", "express", "father", "fire", "forever", "game", "games",
@@ -228,6 +234,22 @@ RE_EXCESS_BLANKS = re.compile(r"(\r?\n){3,}")
 _SECTION_WIDTH = 62
 _SECTION_RULE = "=" * _SECTION_WIDTH
 
+# ANSI colors
+_C_RESET = "\033[0m"
+_C_BOLD = "\033[1m"
+_C_DIM = "\033[2m"
+_C_ULINE = "\033[4m"
+_C_RED = "\033[31m"
+_C_GREEN = "\033[32m"
+_C_YELLOW = "\033[33m"
+_C_BLUE = "\033[34m"
+_C_MAGENTA = "\033[35m"
+_C_CYAN = "\033[36m"
+_C_WHITE = "\033[37m"
+_C_BG_BLUE = "\033[44m"
+_C_BG_GREEN = "\033[42m"
+_C_BG_YELLOW = "\033[43m"
+
 # Verbose logging
 _VERBOSE = True
 
@@ -268,10 +290,12 @@ TMM_CMD_EXE_NAMES = ("tinyMediaManagerCMD", "tinyMediaManager")
 # ===========================================================================
 
 def _heading(title: str) -> None:
-    print(f"\n{_SECTION_RULE}\n  {title}\n{_SECTION_RULE}")
+    print(f"\n{_C_BOLD}{_C_CYAN}{_SECTION_RULE}{_C_RESET}")
+    print(f"  {_C_BOLD}{_C_WHITE}{title}{_C_RESET}")
+    print(f"{_C_BOLD}{_C_CYAN}{_SECTION_RULE}{_C_RESET}")
 
 def _bullet(msg: str) -> None:
-    print(f"  \xB7 {msg}")
+    print(f"  {_C_BOLD}{_C_GREEN}\u2022{_C_RESET} {msg}")
 
 def _indent(msg: str) -> None:
     print(f"    {msg}")
@@ -1260,7 +1284,6 @@ def _split_runon_trailing_word(token: str) -> str:
 def guess_loose_title_without_year(stem: str) -> str | None:
     s = stem.strip().replace(".", " ").replace("_", " ")
     s = RE_LOOSE_JUNK_TOKEN.sub(" ", s)
-    s = re.split(r"\s[-–]\s", s, maxsplit=1)[0]
     s = _insert_letter_digit_spaces(s)
     s = RE_MULTI_SPACE.sub(" ", s).strip(" .-_")
     if s: s = " ".join(_split_runon_trailing_word(p) for p in s.split())
@@ -1542,6 +1565,17 @@ def iter_loose_movie_files(root: Path) -> list[Path]:
                 if child.is_file() and child.suffix.lower() in MOVIE_EXTENSIONS: out.append(child)
     return out
 
+def _find_all_movie_files(root: Path) -> list[Path]:
+    """Find all movie files (loose + in folders), excluding series."""
+    out: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file(): continue
+        if is_own_file(p, root): continue
+        if p.suffix.lower() not in MOVIE_EXTENSIONS: continue
+        if _is_series_path(p): continue
+        out.append(p)
+    return out
+
 def organize_loose_videos_in_root(root: Path, *, tmdb_api_key: str = "", omdb_api_key: str = "", auto_fetch_ro_subtitles: bool = True, subliminal_exe: str = "", opensubtitlescom_user: str = "") -> None:
     t0 = _timer_start()
     _v(f"organize_loose_videos_in_root: root={root}")
@@ -1642,18 +1676,18 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
     os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
     _v(f"TMDB={'set' if tmdb_k else 'NOT SET'}, OMDB={'set' if omdb_k else 'NOT SET'}, OS_API={'set' if os_api_key else 'NOT SET'}")
     _heading("Process movies to Processed/ (non-destructive)")
-    loose = list(iter_loose_movie_files(root))
-    _v(f"Found {len(loose)} loose movie file(s)")
-    if not loose:
-        _bullet("No loose movie files found.")
+    files = list(_find_all_movie_files(root))
+    _v(f"Found {len(files)} movie file(s)")
+    if not files:
+        _bullet("No movie files found.")
         return
     processed_dir = root / "Processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     _v(f"Processed dir: {processed_dir}")
     copied = pattern_misses = skipped = posters = subs = srt_fixed = remuxed_count = 0
     need_subs: list[tuple[Path, int | None]] = []
-    for i, fp in enumerate(loose):
-        _v(f"[{i+1}/{len(loose)}] {fp.name}")
+    for i, fp in enumerate(files):
+        _v(f"[{i+1}/{len(files)}] {fp.name}")
         set_window_title(f"Process: {fp.name}")
         orig_stem = fp.stem
         parsed = parse_loose_movie_stem(orig_stem)
@@ -1848,15 +1882,16 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
 
 def rename_folders(root: Path) -> None:
     _v(f"rename_folders: root={root}")
-    folders = []
-    for dirpath, dirnames, _ in os.walk(root):
-        for d in dirnames: folders.append(Path(dirpath) / d)
+    folders = [d for d in root.iterdir() if d.is_dir()]
     folders.sort(key=lambda p: len(p.parts), reverse=True)
     _v(f"  Found {len(folders)} total folders")
     renamed = 0
     for folder in folders:
         set_window_title(f"Rename folder: {folder.name}")
         if not folder.exists(): continue
+        if _is_series_path(folder):
+            _vv(f"  skip {folder.name} (series episode)")
+            continue
         m = RE_MOVIE_FOLDER.match(folder.name)
         if not m:
             _vv(f"  skip {folder.name} (no match)")
@@ -1883,6 +1918,12 @@ def rename_media_files(root: Path) -> None:
     renamed = already_ok = errors = 0
     for dirpath, _, filenames in os.walk(root):
         dp = Path(dirpath)
+        if dp.parent != root:
+            _vv(f"  skip dir {dp.name} (not root-level)")
+            continue
+        if _is_series_path(dp):
+            _vv(f"  skip dir {dp.name} (series episode)")
+            continue
         m = RE_YEAR_NAME_FOLDER.match(dp.name)
         if not m:
             _vv(f"  skip dir {dp.name} (no year-name match)")
@@ -1919,19 +1960,52 @@ def rename_media_files(root: Path) -> None:
     _bullet(f"Renamed: {renamed}, already ok: {already_ok}{', errors: ' + str(errors) if errors else ''}")
 
 def clean_files(root: Path) -> None:
-    removed = 0
-    for dirpath, _, filenames in os.walk(root):
+    removed = dirs_done = 0
+    trash = root / ".deletedByTMM"
+    for dirpath, dirnames, filenames in os.walk(root):
         dp = Path(dirpath)
+        if _is_series_path(dp):
+            dirnames.clear()
+            continue
+        if dp == trash or dp.parent == trash:
+            dirnames.clear()
+            continue
+        junk_dirs = [d for d in dirnames if d.lower() in JUNK_DIRS]
+        for jd in junk_dirs:
+            jdir = dp / jd
+            trash.mkdir(parents=True, exist_ok=True)
+            dest = trash / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{'_'.join(jdir.relative_to(root).parts)}"
+            try:
+                jdir.rename(dest)
+                dirs_done += 1
+            except OSError:
+                try:
+                    shutil.move(str(jdir), str(dest))
+                    dirs_done += 1
+                except OSError:
+                    pass
+        dirnames[:] = [d for d in dirnames if d.lower() not in JUNK_DIRS and d != ".deletedByTMM"]
         for fname in filenames:
             set_window_title(f"Clean: {fname}")
             fp = dp / fname
             if is_own_file(fp, root): continue
             sl = fp.stem.lower()
             el = fp.suffix.lower()
-            if sl in JUNK_STEMS:
-                try: fp.unlink(); removed += 1
-                except OSError: pass
-    _bullet(f"Removed {removed} file(s)")
+            if sl in JUNK_STEMS or el in JUNK_EXTENSIONS:
+                trash.mkdir(parents=True, exist_ok=True)
+                rel = fp.relative_to(root)
+                dest_name = "_".join(rel.with_suffix("").parts) + rel.suffix
+                dest = trash / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{dest_name}"
+                try:
+                    fp.rename(dest)
+                    removed += 1
+                except OSError:
+                    try:
+                        shutil.move(str(fp), str(dest))
+                        removed += 1
+                    except OSError:
+                        pass
+    _bullet(f"Moved {removed} file(s), {dirs_done} dir(s) to .deletedByTMM/")
 
 FOLDER_NAME_RE = re.compile(r"^(?:\((\d{4})\)\s*)?(.+)$|^(\d{4})\s*[-–]\s*(.+)$")
 
@@ -2038,7 +2112,7 @@ def _fix_subtitle(path: Path) -> None:
     _safe_replace_file(tmp, path)
 
 def fix_subtitles(root: Path) -> None:
-    subs = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUBTITLE_EXTENSIONS and ".fixed." not in p.name and ".bak" not in p.suffixes and ".tmpfix" not in p.name)
+    subs = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUBTITLE_EXTENSIONS and ".fixed." not in p.name and ".bak" not in p.suffixes and ".tmpfix" not in p.name and not _is_series_path(p))
     if not subs: _bullet("No .srt/.sub files found."); return
     _bullet(f"Checking {len(subs)} subtitle file(s)...")
     for f in subs: set_window_title(f"Fix sub: {f.name}"); _fix_subtitle(f)
@@ -2175,6 +2249,10 @@ def strip_mkvs(root: Path, log_path: Path, *, mkvmerge_dir: str = "") -> None:
     ok = skipped = errors = 0
     for i, path in enumerate(videos):
         _v(f"[{i+1}/{len(videos)}] Processing: {path.name}")
+        if _is_series_path(path):
+            _vv(f"  skip {path.name} (series episode)")
+            skipped += 1
+            continue
         try: rel = path.relative_to(root)
         except ValueError: rel = path
         set_window_title(f"Strip MKV: {rel}")
@@ -2300,14 +2378,18 @@ def run_pipeline(root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_r
     tmm_ran = False
     # Phase 0: TMM headless — organizes files, creates folders, downloads posters
     if tmm_run_movies and not skip_rename:
-        tmm_exe = resolve_tmm_cmd_exe(tmm_dir)
-        if tmm_exe:
-            try:
-                _heading("Step 0 - TMM headless (organize + scrape + posters)")
-                _v("Running TMM headless for movies...")
-                run_tmm_cli_sync(tmm_dir, movies=True, tvshows=False)
-                tmm_ran = True
-            except RuntimeError as e: _indent(f"TMM skipped: {e}")
+        series_dirs = [d.name for d in root.iterdir() if d.is_dir() and _is_series_path(d)]
+        if series_dirs:
+            _indent(f"Skip TMM: series content detected ({', '.join(series_dirs)})")
+        else:
+            tmm_exe = resolve_tmm_cmd_exe(tmm_dir)
+            if tmm_exe:
+                try:
+                    _heading("Step 0 - TMM headless (organize + scrape + posters)")
+                    _v("Running TMM headless for movies...")
+                    run_tmm_cli_sync(tmm_dir, movies=True, tvshows=False)
+                    tmm_ran = True
+                except RuntimeError as e: _indent(f"TMM skipped: {e}")
     if organize_loose:
         set_window_title("Organize loose"); _v("Step 0 - Organize loose files"); organize_loose_videos_in_root(root, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, auto_fetch_ro_subtitles=organize_auto_fetch_subs, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user)
     if not skip_rename: set_window_title("Rename folders"); _heading("Step 1 - Rename folders"); _v("Starting rename_folders"); rename_folders(root); _timer_elapsed(t0, "step1")
@@ -2337,13 +2419,13 @@ def run_single_step(step: int, root: Path, *, mkv_strip_log: str, mkvmerge_dir: 
 def _status_line(mkvmerge_dir: str, tmm_dir: str, subliminal_exe: str) -> str:
     parts = []
     ok_m, d_m = _dep_mkvmerge(mkvmerge_dir)
-    parts.append(f"mkvmerge={'OK' if ok_m else 'NO'}")
+    parts.append(f"{_C_GREEN if ok_m else _C_RED}mkvmerge={'OK' if ok_m else 'NO'}{_C_RESET}")
     ok_t, d_t = _dep_tmm(tmm_dir)
-    parts.append(f"TMM={'OK' if ok_t else 'NO'}")
+    parts.append(f"{_C_GREEN if ok_t else _C_RED}TMM={'OK' if ok_t else 'NO'}{_C_RESET}")
     ok_s, d_s = _dep_subliminal(subliminal_exe)
-    parts.append(f"subliminal={'OK' if ok_s else 'NO'}")
+    parts.append(f"{_C_GREEN if ok_s else _C_RED}subliminal={'OK' if ok_s else 'NO'}{_C_RESET}")
     ok_c, d_c = _dep_convert()
-    parts.append(f"convert={'OK' if ok_c else 'NO'}")
+    parts.append(f"{_C_GREEN if ok_c else _C_RED}convert={'OK' if ok_c else 'NO'}{_C_RESET}")
     return " | ".join(parts)
 
 def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
@@ -2578,64 +2660,49 @@ def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
 def interactive_menu(args: argparse.Namespace) -> None:
     set_window_title("Video Organizer")
     root = sanitize_path(args.root)
-    mkv_log = args.mkv_strip_log
     first = True
     while True:
         if first: first = False
         else: print()
-        _heading("VIDEO ORGANIZER")
+        # == header ==
+        print(f"  {_C_BOLD}{_C_CYAN}\U0001f3ac{_C_RESET} {_C_BOLD}{_C_WHITE}VIDEO ORGANIZER{_C_RESET}")
         if not root.is_dir():
-            _bullet(f"ERROR: {root} is not a directory")
+            _indent(f"  {_C_RED}ERROR: {root} is not a directory{_C_RESET}")
         else:
-            _bullet(f"Folder: {root}")
-            _indent(_status_line(args.mkvmerge_dir, args.tmm_dir, args.subliminal))
-        print()
-        print("   1) Series  — full pipeline (flatten + subs + remux)")
-        print("   2) Movies  — full pipeline (rename + organize + posters + subs + remux)")
-        print("   3) Movies  — single step")
-        print("   4) Movies  — organize loose files")
-        print("   5) Subtitles — fix, strip diacritics, remux")
-        print("   6) Tools   — TMM, MKVToolNix")
-        print("   7) Config  — folder, deps, paths")
-        print("   8) Movies  — Process to Processed/ (non-destructive)")
-        print("   0) Exit")
-        print("  " + "-" * 50)
-        try: c = input("\n  Choice [0]: ").strip() or "0"
-        except (EOFError, KeyboardInterrupt): print(); return
-        if c == "0": return
+            _indent(f"  {_C_YELLOW}\U0001f4c1{_C_RESET} {_C_DIM}{root}{_C_RESET}  {_C_YELLOW}\U0001f527{_C_RESET} {_status_line(args.mkvmerge_dir, args.tmm_dir, args.subliminal)}")
+        # == menu ==
+        def _mi(n, t, d):
+            print(f"    {_C_YELLOW}{_C_BOLD}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
+            _indent(f"        {_C_DIM}{d}{_C_RESET}")
+        _mi("1", "\U0001f3ac Pipeline \u2192 Processed/", "Copy source, organize, posters, subs, MKV remux")
+        _mi("2", "\U0001f4fa Series Full Pipeline", "Flatten folders, subtitles, MKV remux")
+        _mi("3", "\U0001f4dd Subtitles Fix, Strip & Remux", "Fix SRT encoding, strip diacritics, embed in MKV")
+        _mi("4", "\U0001f527 Launch TMM / MKVToolNix", "Metadata scraper and muxing tools")
+        _mi("5", "\u2699\ufe0f Settings", "Library folder, dependencies, API keys")
+        _mi("0", "\u274c Exit", "")
+        try:
+            c = input(f"\n  {_C_GREEN}{_C_BOLD}\u25b8 Choice{_C_RESET} {_C_DIM}[0]{_C_RESET}: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt):
+            print(); return
+        if c == "0":
+            print(f"  {_C_YELLOW}Bye!{_C_RESET}")
+            return
         elif c == "1":
             if not root.is_dir(): continue
             mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
-            series_pipeline(root, mkvmerge_exe=mkv_exe, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, use_subliminal=args.use_subliminal, subliminal_exe=args.subliminal)
-            input("  Press Enter...")
+            organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
+            input(f"  {_C_DIM}Press Enter...{_C_RESET}")
         elif c == "2":
             if not root.is_dir(): continue
-            use_tmm = args.tmm_run_movies or bool(resolve_tmm_cmd_exe(args.tmm_dir))
-            run_pipeline(root, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=use_tmm, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, skip_rename=False, skip_rename_files=False, skip_clean=False, skip_posters=False, skip_subtitles=False, skip_mkv_strip=False, mkv_strip_log=mkv_log)
-            input("  Press Enter...")
-        elif c == "3":
-            if not root.is_dir(): continue
-            print("   1) Rename folders  2) Rename files  3) Clean  4) Posters  5) Fix subs  6) MKV")
-            s = input("   Step [cancel]: ").strip()
-            if not s.isdigit() or not (1 <= int(s) <= 6): continue
-            st = int(s)
-            run_single_step(st, root, mkv_strip_log=mkv_log, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=args.tmm_run_movies, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user)
-            input("  Press Enter...")
-        elif c == "4":
-            if not root.is_dir(): continue
-            organize_loose_videos_in_root(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user)
-            input("  Press Enter...")
-        elif c == "5":
-            _menu_subtitles_submenu(root, args)
-        elif c == "6":
-            _menu_tools_submenu(args)
-        elif c == "7":
-            root = _menu_config_submenu(root, args)
-        elif c == "8":
-            if not root.is_dir(): continue
             mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
-            organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
-            input("  Press Enter...")
+            series_pipeline(root, mkvmerge_exe=mkv_exe, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, use_subliminal=args.use_subliminal, subliminal_exe=args.subliminal)
+            input(f"  {_C_DIM}Press Enter...{_C_RESET}")
+        elif c == "3":
+            _menu_subtitles_submenu(root, args)
+        elif c == "4":
+            _menu_tools_submenu(args)
+        elif c == "5":
+            root = _menu_config_submenu(root, args)
 
 # ===========================================================================
 # Series: pipeline
@@ -2878,7 +2945,9 @@ def _action_series(root: Path, args: argparse.Namespace) -> dict:
     return {"ok": 0, "fail": 0, "total": 0}
 
 def _action_movies(root: Path, args: argparse.Namespace) -> dict:
-    run_pipeline(root, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=args.tmm_run_movies, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, skip_rename=args.skip_rename, skip_rename_files=args.skip_rename_files, skip_clean=args.skip_clean, skip_posters=args.skip_posters, skip_subtitles=args.skip_subtitles, skip_mkv_strip=args.skip_mkv_strip, mkv_strip_log=args.mkv_strip_log)
+    mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+    organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
+    return {"ok": 0, "fail": 0, "total": 0}
     return {"ok": 0, "fail": 0, "total": 0}
 
 # Action dispatch table
@@ -3026,7 +3095,9 @@ Examples:
         except KeyboardInterrupt: print("\n  Bye!"); return
         return
     if args.mode == "movies":
-        run_pipeline(root, mkvmerge_dir=args.mkvmerge_dir, tmm_dir=args.tmm_dir, tmm_run_movies=args.tmm_run_movies, tmm_run_tvshows=args.tmm_run_tvshows, organize_loose=args.organize_loose, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, organize_auto_fetch_subs=not args.no_auto_fetch_subs, fetch_subs=args.fetch_subs, subs_lang=args.subs_lang, subs_force=args.subs_force, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, skip_rename=args.skip_rename, skip_rename_files=args.skip_rename_files, skip_clean=args.skip_clean, skip_posters=args.skip_posters, skip_subtitles=args.skip_subtitles, skip_mkv_strip=args.skip_mkv_strip, mkv_strip_log=args.mkv_strip_log)
+        mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
+        organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
+        return
         return
     if args.mode == "series":
         mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
