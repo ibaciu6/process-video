@@ -9,6 +9,9 @@ Single-file Python tool for organizing local movie/TV libraries. Pure stdlib —
 - TMDB/Cinemeta/OMDB title resolution and poster download
 - Rename folders to `Year - Title` format, rename media files to match folder
 - Non-destructive copy-to-Processed mode (leaves originals untouched)
+- Handles existing files: skip/overwrite/keep both
+- Diacritics stripped from subtitles before remux
+- Live progress display for file copy and mkvmerge remux
 
 ### Series
 - Parse episode filenames (`S01E01`, `1x01`, etc.) → `S01E01` format
@@ -23,9 +26,12 @@ Single-file Python tool for organizing local movie/TV libraries. Pure stdlib —
 - Encoding auto-detection (CP1250 / ISO-8859-2 → UTF-8 with BOM)
 - Diacritic stripping (ăâîșț → aai st) — TV-safe output
 - **Hash search runs before remux** (remuxing changes file hash)
+- Diacritics stripped from all SRTs before remux phase
 
 ### MKV remux
 - mkvmerge-based: strip embedded subs, mux sidecar `.srt` as RO track
+- Live verbose output during remux
+- Re-mux option when SRT stripped but MKV has embedded sub
 - ffmpeg fallback when mkvmerge unavailable
 - Keep only the best subtitle track (prefer RO, fallback EN)
 
@@ -46,26 +52,30 @@ python3 video_tool.py
 ### Interactive menu
 
 ```
-   1) Series         — full pipeline (flatten + subs + remux)
-   2) Movies         — full pipeline (rename + organize + posters + subs + remux)
-   3) Movies         — single step
-   4) Movies         — organize loose files
-   5) Subtitles      — hash search, fix, strip, remux submenu
-   6) Tools          — TMM GUI/CLI, MKVToolNix, TMM folder config
-   7) Config         — root folder, install mkvmerge, deps check, API keys
-   8) Movies         — Process to Processed/ (non-destructive)
-   0) Exit
+  VIDEO ORGANIZER
+  ─────────────────────────────────────────
+  /path/to/videos                    mkvmerge=OK  TMM=NO
+
+  [1]  Movies Pipeline       TMDB metadata, posters, subtitles, MKV remux → Processed/
+  [2]  Series Pipeline       Flatten folders, subtitles, MKV remux
+  [3]  Subtitles             Hash search, fix encoding, strip diacritics, remux
+  [4]  Tools                 TMM, MKVToolNix
+  [5]  Settings              Folder, API keys, dependencies
+  [0]  Exit
 ```
 
 Subtitles submenu:
 
 ```
-   1) Search by hash & download (OS.com — exact match)
-   2) Download subtitles (subliminal)
-   3) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)
-   4) Strip Romanian diacritics (ăâîșț → aai st)
-   5) Remux: strip embedded subs + mux sidecar SRT
-   6) Full pipeline: hash search → fix → strip diacritics → remux
+  SUBTITLES
+  ─────────────────────────────────────────
+  [1]  Hash Search           OS.com exact match via video hash
+  [2]  Download              Subliminal batch download
+  [3]  Fix Encoding          Auto-detect cp1250/iso-8859-2 → UTF-8
+  [4]  Strip Diacritics      ăâîșț → aai st
+  [5]  Remux                 Strip embedded subs + mux sidecar SRT
+  [6]  Full Pipeline         hash → fix → strip → remux
+  [0]  Back
 ```
 
 ### CLI / scripting (AI-agent-ready)
