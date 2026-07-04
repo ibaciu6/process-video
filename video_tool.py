@@ -354,6 +354,25 @@ def resolve_subliminal_exe(cli_path: str = "") -> str | None:
 def is_own_file(fp: Path, root: Path) -> bool:
     return fp.parent == root and fp.suffix.lower() in OWN_EXTENSIONS
 
+def _copy_with_progress(src: Path, dst: Path, *, chunk_size: int = 1024 * 1024) -> None:
+    """Copy file with progress indication. Shows MB copied for large files."""
+    size = src.stat().st_size
+    size_mb = size / (1024 * 1024)
+    if size_mb < 50:
+        shutil.copyfile(src, dst)
+        return
+    copied = 0
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(chunk_size)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            copied += len(chunk)
+            pct = (copied / size * 100) if size else 0
+            print(f"\r  {_C_CYAN}copying{_C_RESET} {copied / 1024 / 1024:.1f}/{size_mb:.1f} MB {_C_DIM}({pct:.0f}%){_C_RESET}", end="", flush=True)
+    print()
+
 # ===========================================================================
 # MKV helpers
 # ===========================================================================
@@ -736,12 +755,7 @@ def _mkv_sidecar_srt(mkv_path: Path) -> Path | None:
     srt = mkv_path.with_suffix(".srt")
     return srt if srt.is_file() else None
 
-def _mkv_strip_log(log_path: Path, message: str) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh: fh.write(f"{ts}  {message}\n")
-    except OSError: pass
+
 
 # ===========================================================================
 # Subtitle encoding fix
@@ -1210,15 +1224,16 @@ def remux_series_video(video_path: Path, srt_path: Path, *, mkvmerge_exe: str | 
     mkv_lang = lang_map.get(lang, lang)
     ff_lang_name = lang_name.get(lang, lang.upper())
     try:
+        size_mb = video_path.stat().st_size / 1024 / 1024
+        print(f"  {_C_CYAN}remuxing{_C_RESET}: {video_path.name} ({size_mb:.1f} MB)...", flush=True)
         if use_mkvmerge:
-            cmd = [mkvmerge_exe, "-o", str(tmp), "-S", str(video_path), "--language", f"0:{lang}", "--track-name", f"0:{ff_lang_name}", str(srt_path)]
+            cmd = [mkvmerge_exe, "-v", "-o", str(tmp), "-S", str(video_path), "--language", f"0:{lang}", "--track-name", f"0:{ff_lang_name}", str(srt_path)]
         else:
             cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(srt_path), "-map", "0:v", "-map", "0:a", "-map", "1", "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", "-metadata:s:s:0", f"language={mkv_lang}", "-metadata:s:s:0", f"title={ff_lang_name}", str(tmp)]
         _log_cmd(cmd)
-        _vv("  running muxer (may take a while)...")
-        proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+        proc = subprocess.run(cmd, timeout=3600)
         if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip() or f"exited with {proc.returncode}")
+            raise RuntimeError(f"exited with {proc.returncode}")
         target = video_path if is_mkv or not use_mkvmerge else video_path.with_suffix(".mkv")
         video_path.rename(bak)
         try: tmp.rename(target); bak.unlink()
@@ -1226,11 +1241,12 @@ def remux_series_video(video_path: Path, srt_path: Path, *, mkvmerge_exe: str | 
             if bak.exists() and not target.exists(): bak.rename(video_path)
             if tmp.exists(): tmp.unlink()
             raise
+        print(f"  {_C_GREEN}remuxed{_C_RESET}: {video_path.name}", flush=True)
         return True
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         if tmp.exists(): tmp.unlink()
         if bak.exists() and not video_path.exists(): bak.rename(video_path)
-        _bullet(f"ERROR remuxing {video_path.name}: {exc}")
+        print(f"  {_C_RED}ERROR{_C_RESET} remuxing {video_path.name}: {exc}")
         return False
 
 # ===========================================================================
@@ -1395,17 +1411,23 @@ def tmdb_fetch_poster_jpg(api_key: str, title: str, year: str, dest: Path) -> bo
 
 def fetch_movie_poster_open_sources(dest: Path, title: str, year: str, *, tmdb_key: str, omdb_key: str) -> tuple[bool, str]:
     _v(f"Fetch poster: {title} ({year})")
+    print(f"    {_C_CYAN}poster{_C_RESET}: {title} ({year})...", end="", flush=True)
     if tmdb_key and tmdb_fetch_poster_jpg(tmdb_key, title, year, dest):
-        _vv("  TMDB OK"); return True, "TMDB"
+        print(f" {_C_GREEN}TMDB{_C_RESET}")
+        return True, "TMDB"
     _vv("  TMDB failed")
     if omdb_key and omdb_fetch_poster_jpg(omdb_key, title, year, dest):
-        _vv("  OMDb OK"); return True, "OMDb"
+        print(f" {_C_GREEN}OMDb{_C_RESET}")
+        return True, "OMDb"
     _vv("  OMDb failed")
     if cinemeta_fetch_poster_jpg(title, year, dest):
-        _vv("  Cinemeta OK"); return True, "Cinemeta"
+        print(f" {_C_GREEN}Cinemeta{_C_RESET}")
+        return True, "Cinemeta"
     _vv("  Cinemeta failed")
     if itunes_fetch_poster_jpg(title, year, dest):
-        _vv("  iTunes OK"); return True, "iTunes"
+        print(f" {_C_GREEN}iTunes{_C_RESET}")
+        return True, "iTunes"
+    print(f" {_C_RED}failed{_C_RESET}")
     _vv("  iTunes failed")
     return False, ""
 
@@ -1676,17 +1698,22 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
     os_api_key = (os.environ.get("PROCESS_MOVIES_OPENSUBTITLES_COM_API_KEY", "") or _DEFAULT_OPENSUBTITLES_COM_API_KEY).strip()
     _v(f"TMDB={'set' if tmdb_k else 'NOT SET'}, OMDB={'set' if omdb_k else 'NOT SET'}, OS_API={'set' if os_api_key else 'NOT SET'}")
     _heading("Process movies to Processed/ (non-destructive)")
-    files = list(_find_all_movie_files(root))
-    _v(f"Found {len(files)} movie file(s)")
-    if not files:
-        _bullet("No movie files found.")
-        return
     processed_dir = root / "Processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
-    _v(f"Processed dir: {processed_dir}")
+    # Phase 1: Find and copy new loose files
+    _v("Phase 1: Scanning for new loose files")
+    files = list(_find_all_movie_files(root))
+    _v(f"Found {len(files)} movie file(s)")
     copied = pattern_misses = skipped = posters = subs = srt_fixed = remuxed_count = 0
     need_subs: list[tuple[Path, int | None]] = []
     for i, fp in enumerate(files):
+        # Skip files already in Processed/
+        try:
+            fp.relative_to(processed_dir)
+            _vv(f"  skip {fp.name} (in Processed/)")
+            continue
+        except ValueError:
+            pass
         _v(f"[{i+1}/{len(files)}] {fp.name}")
         set_window_title(f"Process: {fp.name}")
         orig_stem = fp.stem
@@ -1703,7 +1730,7 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
                 guessed = guess_loose_title_without_year(orig_stem)
                 if not guessed:
                     pattern_misses += 1
-                    _bullet(f"  ? {fp.name} \u2014 unrecognized")
+                    _bullet(f"  {_C_YELLOW}?{_C_RESET} {fp.name} {_C_DIM}— unrecognized{_C_RESET}")
                     continue
                 title, year = guessed, ""
                 _vv(f"  guessed: {title}")
@@ -1711,33 +1738,73 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
         tr = tmdb_resolve_movie_title_year_and_id(tmdb_k, title, year or None)
         if tr:
             title, year, tm_mid = tr
-            _vv(f"  TMDB: {title} ({year}) id={tm_mid}")
+            print(f"    {_C_GREEN}TMDB{_C_RESET}: {title} ({year}) {_C_DIM}id={tm_mid}{_C_RESET}")
         elif year:
             cx = cinemeta_lookup_canonical_title(title, year)
             title = cx if cx else title
             _vv(f"  Cinemeta: {title} ({year})")
         else:
             pattern_misses += 1
-            _bullet(f"  ? {fp.name} \u2014 no TMDB match")
+            _bullet(f"  {_C_YELLOW}?{_C_RESET} {fp.name} {_C_DIM}— no TMDB match{_C_RESET}")
             continue
         folder_name = f"{year} - {title}"
         dest_dir = processed_dir / folder_name
         dest_video = dest_dir / f"{title}{fp.suffix.lower()}"
         dest_srt = dest_dir / f"{title}.srt"
         _vv(f"  dest_folder={folder_name}")
+        # Check if any video with this title already exists in the destination folder
+        existing_video = None
+        if dest_dir.exists():
+            for ext in MOVIE_EXTENSIONS:
+                for found in dest_dir.rglob(f"*{ext}"):
+                    if found.is_file():
+                        existing_video = found
+                        break
+                if existing_video:
+                    break
+        if existing_video:
+            print(f"  {_C_YELLOW}!{_C_RESET} {folder_name} {_C_DIM}— already has video: {existing_video.name}{_C_RESET}")
+            try:
+                choice = input(f"    {_C_GREEN}{_C_BOLD}▶{_C_RESET} Skip / Overwrite / Keep both{_C_DIM} [s/o/k]{_C_RESET}: ").strip().lower() or "s"
+            except (EOFError, KeyboardInterrupt):
+                choice = "s"
+            if choice == "o":
+                # Overwrite: delete existing and continue with copy
+                try:
+                    existing_video.unlink()
+                    _vv(f"  deleted: {existing_video.name}")
+                except OSError as e:
+                    _bullet(f"  {_C_RED}!{_C_RESET} delete failed: {e}")
+                    skipped += 1
+                    continue
+            elif choice == "k":
+                # Keep both: rename new file to avoid collision
+                counter = 1
+                while True:
+                    alt_name = f"{title} ({counter}){fp.suffix.lower()}"
+                    alt_dest = dest_dir / alt_name
+                    if not alt_dest.exists():
+                        break
+                    counter += 1
+                dest_video = alt_dest
+                _vv(f"  keeping both as: {alt_name}")
+            else:
+                skipped += 1
+                _bullet(f"  {_C_DIM}skipped{_C_RESET}")
+                continue
         if dest_video.exists():
-            _bullet(f"  = {folder_name} \u2014 exists")
+            _bullet(f"  {_C_GREEN}={_C_RESET} {folder_name} {_C_DIM}exists{_C_RESET}")
             _vv(f"  video exists: {dest_video.name}")
         else:
             dest_dir.mkdir(parents=True, exist_ok=True)
             try:
-                shutil.copyfile(fp, dest_video)
+                print(f"  {_C_CYAN}copying{_C_RESET}: {fp.name} ({fp.stat().st_size / 1024 / 1024:.1f} MB)...")
+                _copy_with_progress(fp, dest_video)
                 copied += 1
-                _bullet(f"  + {folder_name}")
-                _vv(f"  copied: {fp.name} ({fp.stat().st_size / 1024 / 1024:.1f} MB)")
+                _bullet(f"  {_C_GREEN}+{_C_RESET} {folder_name}")
             except OSError as e:
                 skipped += 1
-                _bullet(f"  ! {fp.name} \u2014 copy error: {e}")
+                _bullet(f"  {_C_RED}!{_C_RESET} {fp.name} {_C_DIM}— copy error: {e}{_C_RESET}")
                 continue
         # Download poster
         poster_path = dest_dir / "poster.jpg"
@@ -1752,6 +1819,38 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
         _vv(f"  has_romanian_subtitle={has_ro}, dest_srt_exists={dest_srt.exists()}")
         if auto_fetch_ro_subtitles and not dest_srt.exists() and not has_ro:
             need_subs.append((dest_video, tm_mid))
+    # Phase 2: Process existing files in Processed/ (poster, subs, remux)
+    _v("Phase 2: Processing existing files in Processed/")
+    existing_videos = [vp for vp in processed_dir.rglob("*") if vp.is_file() and vp.suffix.lower() in MOVIE_EXTENSIONS]
+    _v(f"Found {len(existing_videos)} video file(s) in Processed/")
+    for vp in existing_videos:
+        # Skip poster.jpg and other non-video files
+        if vp.suffix.lower() in (".jpg", ".jpeg", ".png", ".txt", ".nfo", ".xml"):
+            continue
+        # Skip if already processed (has Romanian subtitle)
+        if _has_romanian_subtitle(vp):
+            _vv(f"  skip {vp.name} (already has RO sub)")
+            continue
+        # Check for poster
+        poster_path = vp.parent / "poster.jpg"
+        if not poster_path.exists():
+            # Try to extract title/year from folder name
+            folder_match = re.match(r"(\d{4})\s*[-–]\s*(.+)", vp.parent.name)
+            if folder_match:
+                ex_year, ex_title = folder_match.groups()
+                if fetch_movie_poster_open_sources(poster_path, ex_title, ex_year, tmdb_key=tmdb_k, omdb_key=omdb_k):
+                    posters += 1
+                    _vv(f"  poster downloaded for {vp.parent.name}")
+        # Check for subtitle
+        srtp = vp.with_suffix(".srt")
+        if auto_fetch_ro_subtitles and not srtp.exists() and not _has_romanian_subtitle_sidecar(vp):
+            # Try to get TMDB ID from folder name
+            folder_match = re.match(r"(\d{4})\s*[-–]\s*(.+)", vp.parent.name)
+            if folder_match:
+                ex_year, ex_title = folder_match.groups()
+                tr = tmdb_resolve_movie_title_year_and_id(tmdb_k, ex_title, ex_year)
+                if tr:
+                    need_subs.append((vp, tr[2]))
     # Batch subtitle download
     if auto_fetch_ro_subtitles and need_subs:
         _bullet(f"Fetching subtitles for {len(need_subs)} movie(s)...")
@@ -1767,9 +1866,10 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
                 _vv(f"  trying hash for {p.name}")
                 if opensubtitles_search_and_download_by_hash(p, srt_path, api_key=os_api_key, lang="ro"):
                     subs += 1
-                    _vv(f"  hash download OK")
+                    print(f"    {_C_GREEN}sub OK{_C_RESET}: {p.name} {_C_DIM}(hash){_C_RESET}")
                     if fix_srt_file(srt_path):
                         srt_fixed += 1
+                    strip_srt_diacritics(srt_path)
                 else:
                     _vv(f"  hash download failed")
         # Phase 1: OpenSubtitles API for movies with TMDB IDs
@@ -1783,9 +1883,10 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
                 _vv(f"  trying OS.com for {p.name} (TMDB id={tm_mid})")
                 if not srt_path.exists() and opensubtitles_com_download_romanian_srt(os_api_key, tm_mid, srt_path):
                     subs += 1
-                    _vv(f"  OS.com download OK")
+                    print(f"    {_C_GREEN}sub OK{_C_RESET}: {p.name} {_C_DIM}(OS.com TMDB){_C_RESET}")
                     if fix_srt_file(srt_path):
                         srt_fixed += 1
+                    strip_srt_diacritics(srt_path)
                 else:
                     _vv(f"  OS.com download failed")
         # Phase 2: subliminal for remaining
@@ -1825,9 +1926,10 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
                     srt_path = p.with_suffix(".srt")
                     if srt_path.exists() and srt_path.stat().st_size > 50:
                         subs += 1
-                        _vv(f"  subliminal downloaded: {srt_path.name}")
+                        print(f"    {_C_GREEN}sub OK{_C_RESET}: {p.name} {_C_DIM}(subliminal){_C_RESET}")
                         if fix_srt_file(srt_path):
                             srt_fixed += 1
+                        strip_srt_diacritics(srt_path)
                     else:
                         _vv(f"  subliminal no sub for: {p.name}")
         # Phase 3: Romanian sites (pass TMDB ID for titrari.ro)
@@ -1840,16 +1942,16 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
             _vv(f"  trying Romanian sites for: {query}")
             if _download_from_romanian_subtitles_better(query, srt_path, tmdb_api_key=tmdb_k, tmdb_id=tm_mid):
                 subs += 1
-                _vv(f"  Romanian site download OK")
+                print(f"    {_C_GREEN}sub OK{_C_RESET}: {p.name} {_C_DIM}(Romanian){_C_RESET}")
                 if fix_srt_file(srt_path):
                     srt_fixed += 1
-                _bullet(f"  ~ Romanian: {srt_path.name}")
+                strip_srt_diacritics(srt_path)
             else:
                 _vv(f"  Romanian sites failed")
         if subs > pre_subs:
-            _bullet(f"  downloaded {subs - pre_subs} subtitle(s)")
-    # Remux: embed .srt into MKV where possible
-    remuxed_count = 0
+            _bullet(f"  {_C_GREEN}downloaded {subs - pre_subs} subtitle(s){_C_RESET}")
+    # Remux: strip diacritics from existing SRTs + embed .srt into MKV where possible
+    remuxed_count = stripped_count = 0
     if mkvmerge_exe:
         _v(f"Remux phase: scanning for video files in Processed/")
         remuxable = [vp for ext in MOVIE_EXTENSIONS for vp in processed_dir.rglob(f"*{ext}")] + \
@@ -1861,20 +1963,36 @@ def organize_loose_to_processed(root: Path, *, tmdb_api_key: str = "", omdb_api_
             if not srtp.is_file():
                 _vv(f"    no sidecar SRT, skipping")
                 continue
+            # Strip diacritics from SRT if needed
+            stripped_this = strip_srt_diacritics(srtp)
+            if stripped_this:
+                stripped_count += 1
             if _has_romanian_subtitle(vp):
-                _vv(f"    already has embedded RO sub, skipping")
-                continue
+                print(f"  {_C_YELLOW}!{_C_RESET} {vp.name} {_C_DIM}— already has embedded RO sub, SRT stripped: {'yes' if stripped_this else 'no'}{_C_RESET}")
+                try:
+                    choice = input(f"    {_C_GREEN}{_C_BOLD}▶{_C_RESET} Skip / Re-mux (replace embedded) / Leave as-is{_C_DIM} [s/r/l]{_C_RESET}: ").strip().lower() or "s"
+                except (EOFError, KeyboardInterrupt):
+                    choice = "s"
+                if choice == "r":
+                    pass  # continue to remux below
+                elif choice == "l":
+                    _vv(f"    leaving as-is")
+                    continue
+                else:
+                    _vv(f"    skipping")
+                    continue
             if remux_series_video(vp, srtp, mkvmerge_exe=mkvmerge_exe):
                 remuxed_count += 1
-                _bullet(f"  ~ remuxed: {vp.parent.name}/{vp.name}")
+        if stripped_count:
+            _bullet(f"  {_C_GREEN}Stripped diacritics from {stripped_count} SRT(s){_C_RESET}")
         if remuxed_count:
-            _bullet(f"Remuxed {remuxed_count} file(s)")
+            _bullet(f"  {_C_GREEN}Remuxed {remuxed_count} file(s){_C_RESET}")
         else:
             _v("  No files remuxed")
     _timer_elapsed(t0, "organize_loose_to_processed")
     _heading("Summary")
     _bullet(f"Copied: {copied}, unrecognized: {pattern_misses}, skipped: {skipped}")
-    _bullet(f"Posters: {posters}, subtitles: {subs}, SRT fixed: {srt_fixed}, remuxed: {remuxed_count}")
+    _bullet(f"Posters: {posters}, subtitles: {subs}, SRT fixed: {srt_fixed}, diacritics stripped: {stripped_count}, remuxed: {remuxed_count}")
 
 # ===========================================================================
 # Movies: Steps 1-3 (rename folders, rename files, clean)
@@ -2236,14 +2354,14 @@ def _mkv_remux_strip(mkv_path: Path, audio_ids: list[int], sidecar_srt: Path | N
     else:
         out_tmp.rename(output_path)
 
-def strip_mkvs(root: Path, log_path: Path, *, mkvmerge_dir: str = "") -> None:
+def strip_mkvs(root: Path, *, mkvmerge_dir: str = "") -> None:
     t0 = _timer_start()
     _v(f"Step 6 - MKV remux: scanning {root}")
     exe = resolve_mkvmerge_exe(mkvmerge_dir)
-    if not exe: _bullet("mkvmerge not found, skipping Step 6."); _mkv_strip_log(log_path, "SKIP: mkvmerge not found"); return
+    if not exe: _bullet("mkvmerge not found, skipping Step 6."); return
     videos = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in MOVIE_EXTENSIONS and ".mkvstrip.tmp" not in p.name and ".mkvstrip.bak" not in p.name)
     _v(f"Found {len(videos)} video file(s)")
-    if not videos: _bullet("No videos found."); _mkv_strip_log(log_path, "No videos"); return
+    if not videos: _bullet("No videos found."); return
     processed_dir = root / "Processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     ok = skipped = errors = 0
@@ -2256,30 +2374,29 @@ def strip_mkvs(root: Path, log_path: Path, *, mkvmerge_dir: str = "") -> None:
         try: rel = path.relative_to(root)
         except ValueError: rel = path
         set_window_title(f"Strip MKV: {rel}")
-        # Skip if already processed — output exists in Processed/
         out_path = (processed_dir / rel).with_suffix(".mkv")
         if out_path.exists():
             skipped += 1
-            _mkv_strip_log(log_path, f"SKIP {rel}: already in Processed")
+            _vv(f"  skip {rel}: already in Processed")
             continue
         is_mkv = path.suffix.lower() == ".mkv"
         try: info = _mkvmerge_identify(path, exe=exe)
-        except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR identify {rel}: {exc}"); continue
+        except Exception as exc: errors += 1; _vv(f"  ERROR identify {rel}: {exc}"); continue
         tracks = info.get("tracks") or []
-        if not any(t.get("type") == "video" for t in tracks): skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: no video"); continue
+        if not any(t.get("type") == "video" for t in tracks): skipped += 1; _vv(f"  skip {rel}: no video"); continue
         sidecar = _mkv_sidecar_srt(path)
         if not is_mkv:
-            if sidecar is None: skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: no sidecar .srt"); continue
-            if _has_romanian_subtitle(path): skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: already has RO"); continue
-            try: _mkv_remux_strip(path, [], sidecar, [], mkvmerge_exe=exe, output_path=out_path); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: remuxed with {sidecar.name} -> Processed")
-            except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR remux {rel}: {exc}")
+            if sidecar is None: skipped += 1; _vv(f"  skip {rel}: no sidecar .srt"); continue
+            if _has_romanian_subtitle(path): skipped += 1; _vv(f"  skip {rel}: already has RO"); continue
+            try: _mkv_remux_strip(path, [], sidecar, [], mkvmerge_exe=exe, output_path=out_path); ok += 1; _vv(f"  OK {rel}: remuxed with {sidecar.name} -> Processed")
+            except Exception as exc: errors += 1; _vv(f"  ERROR remux {rel}: {exc}")
             continue
         keep_audio, audio_note = _mkv_select_audio_ids(tracks)
-        if not keep_audio: skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: {audio_note}"); continue
+        if not keep_audio: skipped += 1; _vv(f"  skip {rel}: {audio_note}"); continue
         ro_sub_ids = _mkv_select_romanian_subtitle_ids(tracks)
-        if not _mkv_needs_remux(info, keep_audio, sidecar): skipped += 1; _mkv_strip_log(log_path, f"SKIP {rel}: already correct ({audio_note})"); continue
-        try: _mkv_remux_strip(path, keep_audio, sidecar, ro_sub_ids, mkvmerge_exe=exe, output_path=out_path); ok += 1; _mkv_strip_log(log_path, f"OK {rel}: {audio_note} -> Processed")
-        except Exception as exc: errors += 1; _mkv_strip_log(log_path, f"ERROR remux {rel}: {exc}")
+        if not _mkv_needs_remux(info, keep_audio, sidecar): skipped += 1; _vv(f"  skip {rel}: already correct ({audio_note})"); continue
+        try: _mkv_remux_strip(path, keep_audio, sidecar, ro_sub_ids, mkvmerge_exe=exe, output_path=out_path); ok += 1; _vv(f"  OK {rel}: {audio_note} -> Processed")
+        except Exception as exc: errors += 1; _vv(f"  ERROR remux {rel}: {exc}")
     _bullet(f"MKV: {ok} remuxed to Processed/, {skipped} skipped, {errors} error(s)")
 
 # ===========================================================================
@@ -2369,7 +2486,7 @@ def try_install_mkvtoolnix() -> tuple[bool, str]:
 # Movies: run_pipeline + run_single_step + interactive_menu
 # ===========================================================================
 
-def run_pipeline(root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "", skip_rename: bool = False, skip_rename_files: bool = False, skip_clean: bool = False, skip_posters: bool = False, skip_subtitles: bool = False, skip_mkv_strip: bool = False, mkv_strip_log: str = "") -> None:
+def run_pipeline(root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "", skip_rename: bool = False, skip_rename_files: bool = False, skip_clean: bool = False, skip_posters: bool = False, skip_subtitles: bool = False, skip_mkv_strip: bool = False) -> None:
     t0 = _timer_start()
     _v(f"run_pipeline: root={root}")
     _v(f"  flags: tmdb={'set' if tmdb_api_key else 'no'} omdb={'set' if omdb_api_key else 'no'}")
@@ -2406,15 +2523,13 @@ def run_pipeline(root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_r
     if not skip_mkv_strip:
         set_window_title("MKV remux")
         _heading("Step 6 - MKV remux")
-        log_mkv = sanitize_path(mkv_strip_log) if mkv_strip_log else (root / "mkv_strip.log")
-        _v(f"Starting strip_mkvs (log={log_mkv})")
-        strip_mkvs(root, log_mkv, mkvmerge_dir=mkvmerge_dir)
+        strip_mkvs(root, mkvmerge_dir=mkvmerge_dir)
         _timer_elapsed(t0, "step6")
     _timer_elapsed(t0, "run_pipeline total")
 
-def run_single_step(step: int, root: Path, *, mkv_strip_log: str, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "") -> None:
+def run_single_step(step: int, root: Path, *, mkvmerge_dir: str = "", tmm_dir: str = "", tmm_run_movies: bool = False, tmm_run_tvshows: bool = False, organize_loose: bool = False, tmdb_api_key: str = "", omdb_api_key: str = "", organize_auto_fetch_subs: bool = True, fetch_subs: bool = False, subs_lang: str = "ro", subs_force: bool = False, subliminal_exe: str = "", opensubtitlescom_user: str = "") -> None:
     if step < 1 or step > 6: return
-    run_pipeline(root, mkvmerge_dir=mkvmerge_dir, tmm_dir=tmm_dir, tmm_run_movies=tmm_run_movies and step == 1, tmm_run_tvshows=tmm_run_tvshows and step == 1, organize_loose=organize_loose and step == 1, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, organize_auto_fetch_subs=organize_auto_fetch_subs, fetch_subs=fetch_subs and step in (5, 6), subs_lang=subs_lang, subs_force=subs_force, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, skip_rename=step != 1, skip_rename_files=step != 2, skip_clean=step != 3, skip_posters=step != 4, skip_subtitles=step != 5, skip_mkv_strip=step != 6, mkv_strip_log=mkv_strip_log)
+    run_pipeline(root, mkvmerge_dir=mkvmerge_dir, tmm_dir=tmm_dir, tmm_run_movies=tmm_run_movies and step == 1, tmm_run_tvshows=tmm_run_tvshows and step == 1, organize_loose=organize_loose and step == 1, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key, organize_auto_fetch_subs=organize_auto_fetch_subs, fetch_subs=fetch_subs and step in (5, 6), subs_lang=subs_lang, subs_force=subs_force, subliminal_exe=subliminal_exe, opensubtitlescom_user=opensubtitlescom_user, skip_rename=step != 1, skip_rename_files=step != 2, skip_clean=step != 3, skip_posters=step != 4, skip_subtitles=step != 5, skip_mkv_strip=step != 6)
 
 def _status_line(mkvmerge_dir: str, tmm_dir: str, subliminal_exe: str) -> str:
     parts = []
@@ -2431,18 +2546,22 @@ def _status_line(mkvmerge_dir: str, tmm_dir: str, subliminal_exe: str) -> str:
 def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
     while True:
         print()
-        _heading("Subtitles")
-        print(f"   Folder: {root}")
+        print(f"  {_C_BOLD}{_C_CYAN}SUBTITLES{_C_RESET}")
+        print(f"  {_C_DIM}{'─' * 48}{_C_RESET}")
+        print(f"  {_C_DIM}{root}{_C_RESET}")
         print()
-        print("   1) Search by hash & download (OS.com — exact match)")
-        print("   2) Download subtitles (subliminal)")
-        print("   3) Fix SRT encoding (auto-detect cp1250/iso-8859-2 → UTF-8)")
-        print("   4) Strip Romanian diacritics (ăâîșț → aai st)")
-        print("   5) Remux: strip embedded subs + mux sidecar SRT")
-        print("   6) Full pipeline: hash search → fix → strip diacritics → remux")
-        print("   0) Back")
-        print("  " + "-" * 50)
-        try: c = input("\n  Choice [0]: ").strip() or "0"
+        def _mi(n, t, d):
+            print(f"  {_C_YELLOW}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
+            print(f"       {_C_DIM}{d}{_C_RESET}")
+        _mi("1", "Hash Search", "OS.com exact match via video hash")
+        _mi("2", "Download", "Subliminal batch download")
+        _mi("3", "Fix Encoding", "Auto-detect cp1250/iso-8859-2 → UTF-8")
+        _mi("4", "Strip Diacritics", "ăâîșț → aai st")
+        _mi("5", "Remux", "Strip embedded subs + mux sidecar SRT")
+        _mi("6", "Full Pipeline", "hash → fix → strip → remux")
+        _mi("0", "Back", "")
+        print()
+        try: c = input(f"  {_C_GREEN}{_C_BOLD}▶{_C_RESET} Choice{_C_DIM} [0]{_C_RESET}: ").strip() or "0"
         except (EOFError, KeyboardInterrupt): print(); return
         if c == "0": return
         if not root.is_dir():
@@ -2551,15 +2670,20 @@ def _menu_subtitles_submenu(root: Path, args: argparse.Namespace) -> None:
 def _menu_tools_submenu(args: argparse.Namespace) -> None:
     while True:
         print()
-        _heading("Tools")
-        print("   1) Launch TMM GUI")
-        print("   2) TMM headless — movies")
-        print("   3) TMM headless — TV")
-        print("   4) Set MKVToolNix folder")
-        print("   5) Set TMM folder")
-        print("   0) Back")
-        print("  " + "-" * 50)
-        try: c = input("\n  Choice [0]: ").strip() or "0"
+        print(f"  {_C_BOLD}{_C_CYAN}TOOLS{_C_RESET}")
+        print(f"  {_C_DIM}{'─' * 48}{_C_RESET}")
+        print()
+        def _mi(n, t, d):
+            print(f"  {_C_YELLOW}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
+            print(f"       {_C_DIM}{d}{_C_RESET}")
+        _mi("1", "Launch TMM GUI", "Open TinyMediaManager")
+        _mi("2", "TMM Headless Movies", "Scrape movie metadata")
+        _mi("3", "TMM Headless TV", "Scrape TV show metadata")
+        _mi("4", "Set MKVToolNix Folder", "")
+        _mi("5", "Set TMM Folder", "")
+        _mi("0", "Back", "")
+        print()
+        try: c = input(f"  {_C_GREEN}{_C_BOLD}▶{_C_RESET} Choice{_C_DIM} [0]{_C_RESET}: ").strip() or "0"
         except (EOFError, KeyboardInterrupt): print(); return
         if c == "0": return
         elif c == "1":
@@ -2608,14 +2732,16 @@ def _menu_api_keys_submenu() -> None:
     ]
     while True:
         print()
-        _heading("API Keys")
+        print(f"  {_C_BOLD}{_C_CYAN}API KEYS{_C_RESET}")
+        print(f"  {_C_DIM}{'─' * 48}{_C_RESET}")
+        print()
         for i, (kn, dn) in enumerate(keys, 1):
             v = _CFG_KEYS.get(kn, "")
             disp = v[:4] + "****" if len(v) > 4 else ("(set)" if v else "(empty)")
-            print(f"   {i}) {dn:<26} {disp}")
-        print("   0) Back")
-        print("  " + "-" * 50)
-        try: c = input("\n  Choice [0]: ").strip() or "0"
+            print(f"  {_C_YELLOW}[{i}]{_C_RESET}  {dn:<26} {_C_DIM}{disp}{_C_RESET}")
+        print(f"  {_C_YELLOW}[0]{_C_RESET}  {_C_BOLD}Back{_C_RESET}")
+        print()
+        try: c = input(f"  {_C_GREEN}{_C_BOLD}▶{_C_RESET} Choice{_C_DIM} [0]{_C_RESET}: ").strip() or "0"
         except (EOFError, KeyboardInterrupt): print(); return
         if c == "0": return
         if c.isdigit() and 1 <= int(c) <= len(keys):
@@ -2625,19 +2751,23 @@ def _menu_api_keys_submenu() -> None:
 def _menu_config_submenu(root: Path, args: argparse.Namespace) -> Path:
     while True:
         print()
-        _heading("Config")
-        print(f"   Root: {root}")
-        print(f"   MKV:  {args.mkvmerge_dir or TOOL_DIR_MKVMERGE or '(auto)'}")
-        print(f"   TMM:  {args.tmm_dir or TOOL_DIR_TMM or '(auto)'}")
-        print(f"   Lang: {args.subs_lang}")
+        print(f"  {_C_BOLD}{_C_CYAN}SETTINGS{_C_RESET}")
+        print(f"  {_C_DIM}{'─' * 48}{_C_RESET}")
+        print(f"  {_C_DIM}Root: {root}{_C_RESET}")
+        print(f"  {_C_DIM}MKV:  {args.mkvmerge_dir or TOOL_DIR_MKVMERGE or '(auto)'}{_C_RESET}")
+        print(f"  {_C_DIM}TMM:  {args.tmm_dir or TOOL_DIR_TMM or '(auto)'}{_C_RESET}")
+        print(f"  {_C_DIM}Lang: {args.subs_lang}{_C_RESET}")
         print()
-        print("   1) Change root folder")
-        print("   2) Install mkvmerge")
-        print("   3) Check dependencies")
-        print("   4) API keys — TMDB, OMDB, OpenSubtitles")
-        print("   0) Back")
-        print("  " + "-" * 50)
-        try: c = input("\n  Choice [0]: ").strip() or "0"
+        def _mi(n, t, d):
+            print(f"  {_C_YELLOW}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
+            if d: print(f"       {_C_DIM}{d}{_C_RESET}")
+        _mi("1", "Change Root Folder", "")
+        _mi("2", "Install mkvmerge", "")
+        _mi("3", "Check Dependencies", "")
+        _mi("4", "API Keys", "TMDB, OMDB, OpenSubtitles")
+        _mi("0", "Back", "")
+        print()
+        try: c = input(f"  {_C_GREEN}{_C_BOLD}▶{_C_RESET} Choice{_C_DIM} [0]{_C_RESET}: ").strip() or "0"
         except (EOFError, KeyboardInterrupt): print(); return root
         if c == "0": return root
         elif c == "1":
@@ -2665,27 +2795,32 @@ def interactive_menu(args: argparse.Namespace) -> None:
         if first: first = False
         else: print()
         # == header ==
-        print(f"  {_C_BOLD}{_C_CYAN}\U0001f3ac{_C_RESET} {_C_BOLD}{_C_WHITE}VIDEO ORGANIZER{_C_RESET}")
+        print()
+        print(f"  {_C_BOLD}{_C_CYAN}VIDEO ORGANIZER{_C_RESET}")
+        print(f"  {_C_DIM}{'─' * 48}{_C_RESET}")
         if not root.is_dir():
-            _indent(f"  {_C_RED}ERROR: {root} is not a directory{_C_RESET}")
+            print(f"  {_C_RED}ERROR: {root} is not a directory{_C_RESET}")
         else:
-            _indent(f"  {_C_YELLOW}\U0001f4c1{_C_RESET} {_C_DIM}{root}{_C_RESET}  {_C_YELLOW}\U0001f527{_C_RESET} {_status_line(args.mkvmerge_dir, args.tmm_dir, args.subliminal)}")
+            print(f"  {_C_DIM}{root}{_C_RESET}")
+            print(f"  {_status_line(args.mkvmerge_dir, args.tmm_dir, args.subliminal)}")
+        print()
         # == menu ==
         def _mi(n, t, d):
-            print(f"    {_C_YELLOW}{_C_BOLD}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
-            _indent(f"        {_C_DIM}{d}{_C_RESET}")
-        _mi("1", "\U0001f3ac Pipeline \u2192 Processed/", "Copy source, organize, posters, subs, MKV remux")
-        _mi("2", "\U0001f4fa Series Full Pipeline", "Flatten folders, subtitles, MKV remux")
-        _mi("3", "\U0001f4dd Subtitles Fix, Strip & Remux", "Fix SRT encoding, strip diacritics, embed in MKV")
-        _mi("4", "\U0001f527 Launch TMM / MKVToolNix", "Metadata scraper and muxing tools")
-        _mi("5", "\u2699\ufe0f Settings", "Library folder, dependencies, API keys")
-        _mi("0", "\u274c Exit", "")
+            print(f"  {_C_YELLOW}[{n}]{_C_RESET}  {_C_BOLD}{t}{_C_RESET}")
+            print(f"       {_C_DIM}{d}{_C_RESET}")
+        _mi("1", "Movies Pipeline", "TMDB metadata, posters, subtitles, MKV remux → Processed/")
+        _mi("2", "Series Pipeline", "Flatten folders, subtitles, MKV remux")
+        _mi("3", "Subtitles", "Hash search, fix encoding, strip diacritics, remux")
+        _mi("4", "Tools", "TMM, MKVToolNix")
+        _mi("5", "Settings", "Folder, API keys, dependencies")
+        _mi("0", "Exit", "")
+        print()
         try:
-            c = input(f"\n  {_C_GREEN}{_C_BOLD}\u25b8 Choice{_C_RESET} {_C_DIM}[0]{_C_RESET}: ").strip() or "0"
+            c = input(f"  {_C_GREEN}{_C_BOLD}▶{_C_RESET} Choice{_C_DIM} [0]{_C_RESET}: ").strip() or "0"
         except (EOFError, KeyboardInterrupt):
             print(); return
         if c == "0":
-            print(f"  {_C_YELLOW}Bye!{_C_RESET}")
+            print(f"  {_C_DIM}Bye!{_C_RESET}")
             return
         elif c == "1":
             if not root.is_dir(): continue
@@ -2948,7 +3083,6 @@ def _action_movies(root: Path, args: argparse.Namespace) -> dict:
     mkv_exe = resolve_mkvmerge_exe(args.mkvmerge_dir)
     organize_loose_to_processed(root, tmdb_api_key=args.tmdb_api_key, omdb_api_key=args.omdb_api_key, auto_fetch_ro_subtitles=not args.no_auto_fetch_subs, subliminal_exe=args.subliminal, opensubtitlescom_user=args.opensubtitlescom_user, mkvmerge_exe=mkv_exe)
     return {"ok": 0, "fail": 0, "total": 0}
-    return {"ok": 0, "fail": 0, "total": 0}
 
 # Action dispatch table
 _ACTIONS: dict[str, tuple[str, callable]] = {
@@ -3052,7 +3186,6 @@ Examples:
     ap.add_argument("--skip-posters", action="store_true", help="Skip poster conversion")
     ap.add_argument("--skip-subtitles", action="store_true", help="Skip subtitle fixing")
     ap.add_argument("--skip-mkv-strip", action="store_true", help="Skip MKV remux")
-    ap.add_argument("--mkv-strip-log", default="", help="MKV log path")
     ap.add_argument("--to-processed", action="store_true", help="Non-destructive: copy movies to Processed/")
 
     args = ap.parse_args()
