@@ -2898,6 +2898,7 @@ def series_pipeline(root: Path, *, mkvmerge_exe: str | None, fetch_subs: bool = 
 
     def _process_srt(vp: Path, srtp: Path, lang: str) -> bool:
         """Fix encoding, strip diacritics, remux. Returns True on success."""
+        nonlocal srt_fixed, srt_errors, video_done, video_errors
         if not fix_srt_file(srtp):
             srt_errors += 1; return False
         srt_fixed += 1
